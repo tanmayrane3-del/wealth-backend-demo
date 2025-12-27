@@ -10,13 +10,14 @@ app.use(express.json());
 const userRoutes = require("./routes/users");
 const incomeRoutes = require("./routes/income");
 const expenseRoutes = require("./routes/expenses");
+const passwordResetRoutes = require("./routes/passwordReset");
 
 // Use routes
 app.use("/api/users", userRoutes);
 app.use("/api/income", incomeRoutes);
 app.use("/api/expenses", expenseRoutes);
 app.use("/api/sessions", sessionRoutes);
-
+app.use("/api/password-reset", passwordResetRoutes);
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);

@@ -54,4 +54,53 @@ const getUserByEmail = async (req, res) => {
   }
 };
 
-module.exports = { createUser, getUserByEmail };
+// NEW FUNCTION
+const validateLogin = async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return fail(res, "Email and password are required", 400);
+  }
+
+  try {
+    // Get user by email
+    const result = await pool.query(
+      `SELECT user_id, email, password_hash, full_name, is_active, is_email_verified 
+       FROM users 
+       WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rowCount === 0) {
+      return fail(res, "Invalid email or password", 401);
+    }
+
+    const user = result.rows[0];
+
+    // Check if user is active
+    if (!user.is_active) {
+      return fail(res, "Account is inactive", 403);
+    }
+
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
+
+    if (!isValidPassword) {
+      return fail(res, "Invalid email or password", 401);
+    }
+
+    // Return user data (without password_hash)
+    success(res, {
+      user_id: user.user_id,
+      email: user.email,
+      full_name: user.full_name,
+      is_email_verified: user.is_email_verified
+    }, 200);
+
+  } catch (err) {
+    console.error("Validate login error:", err);
+    fail(res, err.message, 500);
+  }
+};
+
+module.exports = { createUser, getUserByEmail, validateLogin };
