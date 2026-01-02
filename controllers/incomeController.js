@@ -1,9 +1,9 @@
 const pool = require("../db");
 
-// Existing function - kept as is
+// FIXED: Changed to use req.user_id instead of req.body.user_id
 const addIncome = async (req, res) => {
   const {
-    user_id, date, time, amount, currency,
+    date, time, amount, currency,
     category_id, source_id, payment_method,
     transaction_reference, notes, tags
   } = req.body;
@@ -20,7 +20,7 @@ const addIncome = async (req, res) => {
         $9, $10, $11
       ) RETURNING income_id`,
       [
-        user_id, date, time, amount, currency,
+        req.user_id, date, time, amount, currency,  // CHANGED: req.user_id instead of user_id
         category_id, source_id, payment_method,
         transaction_reference, notes, tags
       ]
