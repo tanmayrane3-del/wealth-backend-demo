@@ -48,13 +48,14 @@ const getUserExpenses = async (req, res) => {
 
   try {
     let query = `
-      SELECT 
+      SELECT
         e.expense_id,
         e.date,
         e.time,
         e.amount,
         e.currency,
         ec.name AS category_name,
+        ec.icon AS category_icon,
         r.name AS recipient_name,
         e.payment_method,
         e.transaction_reference,
@@ -106,7 +107,7 @@ const getExpenseById = async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT 
+      `SELECT
         e.expense_id,
         e.user_id,
         e.date,
@@ -115,6 +116,7 @@ const getExpenseById = async (req, res) => {
         e.currency,
         e.category_id,
         ec.name AS category_name,
+        ec.icon AS category_icon,
         e.recipient_id,
         r.name AS recipient_name,
         e.payment_method,

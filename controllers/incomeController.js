@@ -48,13 +48,14 @@ const getUserIncome = async (req, res) => {
 
   try {
     let query = `
-      SELECT 
+      SELECT
         i.income_id,
         i.date,
         i.time,
         i.amount,
         i.currency,
         ic.name AS category_name,
+        ic.icon AS category_icon,
         ic.description AS category_description,
         s.name AS source_name,
         s.description AS source_description,
@@ -108,7 +109,7 @@ const getIncomeById = async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT 
+      `SELECT
         i.income_id,
         i.user_id,
         i.date,
@@ -117,6 +118,7 @@ const getIncomeById = async (req, res) => {
         i.currency,
         i.category_id,
         ic.name AS category_name,
+        ic.icon AS category_icon,
         i.source_id,
         s.name AS source_name,
         i.payment_method,
