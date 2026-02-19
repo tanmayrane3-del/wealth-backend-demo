@@ -16,6 +16,8 @@ const getRecipients = async (req, res) => {
         r.is_default,
         r.is_global,
         r.is_active,
+        r.payment_identifier,
+        r.default_category_id,
         CASE
           WHEN r.user_id = $1 AND r.is_global = false AND r.is_default = false
           THEN true
@@ -50,7 +52,7 @@ const getRecipients = async (req, res) => {
 // Create a new recipient for the user
 const createRecipient = async (req, res) => {
   const user_id = req.user_id;
-  const { name, type, description, contact_info, is_favorite } = req.body;
+  const { name, type, description, contact_info, is_favorite, payment_identifier, default_category_id } = req.body;
 
   if (!name) {
     return res.status(400).json({
@@ -81,11 +83,14 @@ const createRecipient = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO recipients (
         user_id, name, type, description, contact_info, is_favorite,
+        payment_identifier, default_category_id,
         is_default, is_global, is_active
-      ) VALUES ($1, $2, $3, $4, $5, $6, false, false, true)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false, true)
       RETURNING id, user_id, name, type, description, contact_info,
-                is_favorite, is_default, is_global, is_active, created_at`,
-      [user_id, name, type || null, description || null, contact_info || null, is_favorite || false]
+                is_favorite, is_default, is_global, is_active,
+                payment_identifier, default_category_id, created_at`,
+      [user_id, name, type || null, description || null, contact_info || null,
+       is_favorite || false, payment_identifier || null, default_category_id || null]
     );
 
     res.status(201).json({
@@ -107,7 +112,7 @@ const createRecipient = async (req, res) => {
 const updateRecipient = async (req, res) => {
   const user_id = req.user_id;
   const { id } = req.params;
-  const { name, type, description, contact_info, is_favorite, is_active } = req.body;
+  const { name, type, description, contact_info, is_favorite, is_active, payment_identifier, default_category_id } = req.body;
 
   try {
     // Check if recipient exists
@@ -172,11 +177,15 @@ const updateRecipient = async (req, res) => {
            contact_info = COALESCE($4, contact_info),
            is_favorite = COALESCE($5, is_favorite),
            is_active = COALESCE($6, is_active),
+           payment_identifier = COALESCE($7, payment_identifier),
+           default_category_id = COALESCE($8, default_category_id),
            updated_at = NOW()
-       WHERE id = $7 AND user_id = $8
+       WHERE id = $9 AND user_id = $10
        RETURNING id, user_id, name, type, description, contact_info,
-                 is_favorite, is_default, is_global, is_active, updated_at`,
-      [name, type, description, contact_info, is_favorite, is_active, id, user_id]
+                 is_favorite, is_default, is_global, is_active,
+                 payment_identifier, default_category_id, updated_at`,
+      [name, type, description, contact_info, is_favorite, is_active,
+       payment_identifier, default_category_id, id, user_id]
     );
 
     res.json({
@@ -269,9 +278,69 @@ const deleteRecipient = async (req, res) => {
   }
 };
 
+// Lookup a recipient by payment_identifier (used by SMS auto-detection)
+const getRecipientByPaymentIdentifier = async (req, res) => {
+  const user_id = req.user_id;
+  const { payment_identifier } = req.query;
+
+  if (!payment_identifier) {
+    return res.status(400).json({
+      status: "fail",
+      timestamp: new Date().toISOString(),
+      reason: "payment_identifier query parameter is required"
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+        r.id,
+        r.name,
+        r.type,
+        r.description,
+        r.contact_info,
+        r.is_favorite,
+        r.is_default,
+        r.is_global,
+        r.is_active,
+        r.payment_identifier,
+        r.default_category_id,
+        CASE
+          WHEN r.user_id = $1 AND r.is_global = false AND r.is_default = false
+          THEN true
+          ELSE false
+        END as is_user_specific,
+        COALESCE(
+          (SELECT COUNT(*) FROM expenses WHERE recipient_id = r.id AND user_id = $1),
+          0
+        )::integer as transaction_count
+      FROM recipients r
+      WHERE (r.user_id = $1 OR r.user_id IS NULL OR r.is_default = true)
+        AND r.is_active = true
+        AND LOWER(r.payment_identifier) = LOWER($2)
+      LIMIT 1`,
+      [user_id, payment_identifier]
+    );
+
+    res.json({
+      status: "success",
+      timestamp: new Date().toISOString(),
+      data: result.rows.length > 0 ? result.rows[0] : null
+    });
+  } catch (err) {
+    console.error("Lookup recipient by payment identifier error:", err);
+    res.status(500).json({
+      status: "fail",
+      timestamp: new Date().toISOString(),
+      reason: err.message
+    });
+  }
+};
+
 module.exports = {
   getRecipients,
   createRecipient,
   updateRecipient,
-  deleteRecipient
+  deleteRecipient,
+  getRecipientByPaymentIdentifier
 };

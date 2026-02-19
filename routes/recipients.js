@@ -4,9 +4,13 @@ const {
   getRecipients,
   createRecipient,
   updateRecipient,
-  deleteRecipient
+  deleteRecipient,
+  getRecipientByPaymentIdentifier
 } = require("../controllers/recipientsController");
 const validateSession = require("../middleware/validateSession");
+
+// Lookup recipient by payment_identifier (must be before /:id routes)
+router.get("/lookup", validateSession, getRecipientByPaymentIdentifier);
 
 // Get all recipients
 router.get("/", validateSession, getRecipients);
