@@ -17,7 +17,7 @@ const getRecipients = async (req, res) => {
         r.is_global,
         r.is_active,
         r.payment_identifier,
-        r.default_category_id,
+        r.category_id,
         CASE
           WHEN r.user_id = $1 AND r.is_global = false AND r.is_default = false
           THEN true
@@ -52,7 +52,7 @@ const getRecipients = async (req, res) => {
 // Create a new recipient for the user
 const createRecipient = async (req, res) => {
   const user_id = req.user_id;
-  const { name, type, description, contact_info, is_favorite, payment_identifier, default_category_id } = req.body;
+  const { name, type, description, contact_info, is_favorite, payment_identifier, category_id } = req.body;
 
   if (!name) {
     return res.status(400).json({
@@ -83,14 +83,14 @@ const createRecipient = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO recipients (
         user_id, name, type, description, contact_info, is_favorite,
-        payment_identifier, default_category_id,
+        payment_identifier, category_id,
         is_default, is_global, is_active
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false, true)
       RETURNING id, user_id, name, type, description, contact_info,
                 is_favorite, is_default, is_global, is_active,
-                payment_identifier, default_category_id, created_at`,
+                payment_identifier, category_id, created_at`,
       [user_id, name, type || null, description || null, contact_info || null,
-       is_favorite || false, payment_identifier || null, default_category_id || null]
+       is_favorite || false, payment_identifier || null, category_id || null]
     );
 
     res.status(201).json({
@@ -112,7 +112,7 @@ const createRecipient = async (req, res) => {
 const updateRecipient = async (req, res) => {
   const user_id = req.user_id;
   const { id } = req.params;
-  const { name, type, description, contact_info, is_favorite, is_active, payment_identifier, default_category_id } = req.body;
+  const { name, type, description, contact_info, is_favorite, is_active, payment_identifier, category_id } = req.body;
 
   try {
     // Check if recipient exists
@@ -178,14 +178,14 @@ const updateRecipient = async (req, res) => {
            is_favorite = COALESCE($5, is_favorite),
            is_active = COALESCE($6, is_active),
            payment_identifier = COALESCE($7, payment_identifier),
-           default_category_id = COALESCE($8, default_category_id),
+           category_id = COALESCE($8, category_id),
            updated_at = NOW()
        WHERE id = $9 AND user_id = $10
        RETURNING id, user_id, name, type, description, contact_info,
                  is_favorite, is_default, is_global, is_active,
-                 payment_identifier, default_category_id, updated_at`,
+                 payment_identifier, category_id, updated_at`,
       [name, type, description, contact_info, is_favorite, is_active,
-       payment_identifier, default_category_id, id, user_id]
+       payment_identifier, category_id, id, user_id]
     );
 
     res.json({
@@ -304,7 +304,7 @@ const getRecipientByPaymentIdentifier = async (req, res) => {
         r.is_global,
         r.is_active,
         r.payment_identifier,
-        r.default_category_id,
+        r.category_id,
         CASE
           WHEN r.user_id = $1 AND r.is_global = false AND r.is_default = false
           THEN true
