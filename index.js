@@ -1,4 +1,6 @@
 const express = require("express");
+const https = require("https");
+const http = require("http");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const sessionRoutes = require("./routes/sessions");
@@ -29,6 +31,30 @@ app.use("/api/sources", sourcesRoutes);
 app.use("/api/recipients", recipientsRoutes);
 app.use("/api/payment-methods", paymentMethodsRoutes);
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+
+  // Self-ping every 14 minutes to prevent Render from sleeping
+  const RENDER_URL = process.env.RENDER_URL;
+  if (RENDER_URL) {
+    const pingUrl = `${RENDER_URL}/health`;
+    const client = pingUrl.startsWith("https") ? https : http;
+
+    setInterval(() => {
+      client.get(pingUrl, (res) => {
+        console.log(`[Keep-alive] Pinged ${pingUrl} — status: ${res.statusCode}`);
+      }).on("error", (err) => {
+        console.error(`[Keep-alive] Ping failed: ${err.message}`);
+      });
+    }, 14 * 60 * 1000); // 14 minutes
+
+    console.log(`[Keep-alive] Self-ping scheduled every 14 min → ${pingUrl}`);
+  } else {
+    console.warn("[Keep-alive] RENDER_URL not set — self-ping disabled.");
+  }
 });
