@@ -5,9 +5,9 @@ const { parseSms } = require("../utils/smsParser");
 const OTHER_CATEGORY_ID = "7d659682-2cb0-4a0e-bcad-0440efcaf7f5";
 const OTHER_RECIPIENT_ID = "60c07db2-5f7d-4492-97a8-d584295b5605";
 
-// Income fallbacks — replace with actual UUIDs from your DB
-const OTHER_INCOME_CATEGORY_ID = "REPLACE_WITH_OTHER_INCOME_CATEGORY_UUID";
-const OTHER_SOURCE_ID = "REPLACE_WITH_OTHER_SOURCE_UUID";
+// Income fallbacks
+const OTHER_INCOME_CATEGORY_ID = "0d239074-acfa-4b26-903d-111485ad524c";
+const OTHER_SOURCE_ID = "cab3b79c-7a1a-4bf2-aacc-0cec3a85aade";
 
 /**
  * POST /api/sms/parse
