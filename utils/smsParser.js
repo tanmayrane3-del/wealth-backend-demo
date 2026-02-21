@@ -82,6 +82,9 @@ SMS: ${body}`;
     }
   });
 
+  const { input_tokens, output_tokens } = response.usage;
+  console.log(`[Haiku usage] input=${input_tokens} output=${output_tokens} total=${input_tokens + output_tokens} tokens`);
+
   return JSON.parse(response.content[0].text);
 }
 
