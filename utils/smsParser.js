@@ -9,7 +9,12 @@ const SMS_PARSE_SCHEMA = {
   properties: {
     is_transaction: {
       type: "boolean",
-      description: "true if SMS is a bank debit/expense transaction, false otherwise (OTP, promo, balance alert, etc.)"
+      description: "true if SMS is a bank transaction (debit OR credit), false otherwise (OTP, promo, balance alert, login alert, etc.)"
+    },
+    transaction_direction: {
+      type: "string",
+      enum: ["debit", "credit", "none"],
+      description: "'debit' for money going OUT (expenses, payments, purchases), 'credit' for money coming IN (salary, refunds, transfers received, cashbacks), 'none' if is_transaction is false."
     },
     amount: {
       type: "string",
@@ -41,17 +46,21 @@ const SMS_PARSE_SCHEMA = {
       description: "Short bank name e.g. 'BOB', 'ICICI', 'HDFC'. null if unknown."
     }
   },
-  required: ["is_transaction", "amount", "payment_identifier", "transaction_reference", "date", "time", "payment_method", "bank_sender"],
+  required: ["is_transaction", "transaction_direction", "amount", "payment_identifier", "transaction_reference", "date", "time", "payment_method", "bank_sender"],
   additionalProperties: false
 };
 
 const SYSTEM_PROMPT = `You are an Indian bank SMS parser. Your job is to extract transaction details from bank SMS messages sent to Indian customers.
 
 Rules:
-- Only mark is_transaction=true for DEBIT transactions (money going OUT) — these are expenses.
-- Mark is_transaction=false for: OTPs, credit transactions (money coming IN), balance alerts, promotional messages, login alerts.
-- For UPI payments, payment_identifier is usually a UPI ID like 'paytmqr@paytm' or 'merchant@upi'.
-- For card payments, payment_identifier is the merchant name.
+- Mark is_transaction=true for BOTH debit (money OUT) and credit (money IN) bank transactions.
+- Mark is_transaction=false for: OTPs, balance alerts, promotional messages, login alerts.
+- Set transaction_direction="debit" for money going OUT (expenses, payments, purchases, transfers sent).
+- Set transaction_direction="credit" for money coming IN (salary, refunds, transfers received, cashbacks, dividends).
+- Set transaction_direction="none" if is_transaction=false.
+- For debit/UPI payments, payment_identifier is the recipient UPI ID e.g. 'paytmqr@paytm' or 'merchant@upi'.
+- For debit/card payments, payment_identifier is the merchant name.
+- For credit transactions, payment_identifier is the sender's UPI ID, name, or company identifier if present in the SMS.
 - Extract date from SMS if present; otherwise use the receivedDate field provided.
 - Extract time from SMS if present; otherwise use 00:00.
 - amount must NOT include currency symbols — just digits and decimal point e.g. '500.00'.

@@ -12,6 +12,8 @@ const getIncomeSources = async (req, res) => {
         s.description,
         s.type,
         s.contact_info,
+        s.source_identifier,
+        s.default_category_id,
         s.is_default,
         s.is_global,
         s.is_active,
@@ -49,7 +51,7 @@ const getIncomeSources = async (req, res) => {
 // Create a new income source for the user
 const createIncomeSource = async (req, res) => {
   const user_id = req.user_id;
-  const { name, description, type, contact_info } = req.body;
+  const { name, description, type, contact_info, source_identifier, default_category_id } = req.body;
 
   if (!name) {
     return res.status(400).json({
@@ -79,12 +81,12 @@ const createIncomeSource = async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO income_sources (
-        user_id, name, description, type, contact_info,
-        is_default, is_global, is_active
-      ) VALUES ($1, $2, $3, $4, $5, false, false, true)
-      RETURNING id, user_id, name, description, type, contact_info,
-                is_default, is_global, is_active, created_at`,
-      [user_id, name, description || null, type || null, contact_info || null]
+        user_id, name, description, type, contact_info, source_identifier,
+        default_category_id, is_default, is_global, is_active
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, false, false, true)
+      RETURNING id, user_id, name, description, type, contact_info, source_identifier,
+                default_category_id, is_default, is_global, is_active, created_at`,
+      [user_id, name, description || null, type || null, contact_info || null, source_identifier || null, default_category_id || null]
     );
 
     res.status(201).json({
@@ -106,7 +108,7 @@ const createIncomeSource = async (req, res) => {
 const updateIncomeSource = async (req, res) => {
   const user_id = req.user_id;
   const { id } = req.params;
-  const { name, description, type, contact_info, is_active } = req.body;
+  const { name, description, type, contact_info, source_identifier, default_category_id, is_active } = req.body;
 
   try {
     // Check if source exists
@@ -169,12 +171,14 @@ const updateIncomeSource = async (req, res) => {
            description = COALESCE($2, description),
            type = COALESCE($3, type),
            contact_info = COALESCE($4, contact_info),
-           is_active = COALESCE($5, is_active),
+           source_identifier = COALESCE($5, source_identifier),
+           default_category_id = COALESCE($6, default_category_id),
+           is_active = COALESCE($7, is_active),
            updated_at = NOW()
-       WHERE id = $6 AND user_id = $7
-       RETURNING id, user_id, name, description, type, contact_info,
-                 is_default, is_global, is_active, updated_at`,
-      [name, description, type, contact_info, is_active, id, user_id]
+       WHERE id = $8 AND user_id = $9
+       RETURNING id, user_id, name, description, type, contact_info, source_identifier,
+                 default_category_id, is_default, is_global, is_active, updated_at`,
+      [name, description, type, contact_info, source_identifier || null, default_category_id || null, is_active, id, user_id]
     );
 
     res.json({
