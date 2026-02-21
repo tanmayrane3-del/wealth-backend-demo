@@ -18,6 +18,7 @@ const categoriesRoutes = require("./routes/categories");
 const sourcesRoutes = require("./routes/sources");
 const recipientsRoutes = require("./routes/recipients");
 const paymentMethodsRoutes = require("./routes/paymentMethods");
+const smsRoutes = require("./routes/sms");
 
 // Use routes
 app.use("/api/users", userRoutes);
@@ -30,6 +31,7 @@ app.use("/api/categories", categoriesRoutes);
 app.use("/api/sources", sourcesRoutes);
 app.use("/api/recipients", recipientsRoutes);
 app.use("/api/payment-methods", paymentMethodsRoutes);
+app.use("/api/sms", smsRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
