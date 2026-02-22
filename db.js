@@ -10,7 +10,7 @@ const pool = new Pool({
   database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
   min: 1,             // always keep one warm connection — avoids cold-start burst failures
-  max: 3,
+  max: 10,
   idleTimeoutMillis: 440000, // close idle connections at 440s — PgBouncer kills at 500s
   connectionTimeoutMillis: 8000,  // fail fast: 8s × 2 attempts = 16s max, not 60s
   // TCP keepalive — prevents NAT/firewall from silently dropping idle connections
