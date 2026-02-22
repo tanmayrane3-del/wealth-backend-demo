@@ -10,8 +10,11 @@ const pool = new Pool({
   database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
   max: 3,
-  idleTimeoutMillis: 60000,
+  idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 30000,
+  // TCP keepalive — prevents NAT/firewall from silently dropping idle connections
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
 pool.on("error", (err) => {
