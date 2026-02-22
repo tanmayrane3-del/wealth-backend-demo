@@ -10,7 +10,7 @@ const pool = new Pool({
   database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
   max: 3,
-  idleTimeoutMillis: 10000,
+  idleTimeoutMillis: 60000,
   connectionTimeoutMillis: 30000,
 });
 
