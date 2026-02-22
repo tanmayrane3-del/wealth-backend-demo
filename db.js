@@ -9,11 +9,10 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
-  min: 1,             // always keep one warm connection — avoids cold-start burst failures
+  min: 1,
   max: 10,
-  idleTimeoutMillis: 440000, // close idle connections at 440s — PgBouncer kills at 500s
-  connectionTimeoutMillis: 8000,  // fail fast: 8s × 2 attempts = 16s max, not 60s
-  // TCP keepalive — prevents NAT/firewall from silently dropping idle connections
+  idleTimeoutMillis: 60000,      // clean up extra (non-min) connections after 60s idle
+  connectionTimeoutMillis: 8000, // fail fast: 8s × 2 attempts = 16s max
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
 });
@@ -36,8 +35,8 @@ pool.on("remove", (client) => {
   console.log(`[pool] connection removed — lived ${lived}s`);
 });
 
-// Auto-retry once on stale PgBouncer connections (Connection terminated / ECONNRESET).
-// 300ms delay before retry — gives the pool time to establish a fresh connection.
+// Auto-retry once on stale connections (Connection terminated / ECONNRESET).
+// 2s delay before retry — gives PgBouncer time to accept a new connection.
 // Does NOT retry "timeout exceeded" — pooler is down, retrying wastes another 8s.
 // Transparent to all controllers — no changes needed anywhere else.
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -67,16 +66,14 @@ pool.query("SELECT 1 AS ok")
     if (err.cause) console.error("[DB] Caused by:", err.cause.message);
   });
 
-// Pre-warm a second connection after 120s — by then min:1 is stable,
-// and a second warm connection handles simultaneous requests without waiting.
-setTimeout(async () => {
-  try {
-    const client = await pool.connect();
-    client.release();
-    console.log("[pool] second connection pre-warmed at 120s");
-  } catch (err) {
-    console.warn("[pool] second connection warmup failed:", err.message);
-  }
-}, 120 * 1000);
+// SQL keep-alive ping every 30s — prevents Render's NAT router from dropping
+// idle DB connections. TCP keepalive alone is insufficient on Render's network.
+// Also acts as a proactive health check — stale connections get retried and
+// replaced before any real user request hits them.
+setInterval(() => {
+  pool.query("SELECT 1").catch((err) => {
+    console.warn("[pool] keep-alive ping failed:", err.message);
+  });
+}, 30 * 1000);
 
 module.exports = pool;
