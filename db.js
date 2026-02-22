@@ -5,10 +5,11 @@ const pool = new Pool({
   connectionString: process.env.SUPABASE_URI,
   ssl: { rejectUnauthorized: false },
   max: 3,
-  idleTimeoutMillis: 10000,       // Release idle connections after 10s (before Supabase kills them)
+  idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 10000,
-  keepAlive: true,
-  keepAliveInitialDelayMillis: 10000,
+  // Required for Supabase Transaction Pooler (PgBouncer)
+  // PgBouncer doesn't support named prepared statements
+  statement_cache_size: 0,
 });
 
 // Prevent unhandled errors from crashing the process when
