@@ -31,8 +31,10 @@ pool.on("remove", () => {
 });
 
 // Auto-retry once on stale PgBouncer connections (Connection terminated / ECONNRESET).
-// Does NOT retry "timeout exceeded" — that means the pooler is down; retrying wastes another 8s.
+// 300ms delay before retry — gives the pool time to establish a fresh connection.
+// Does NOT retry "timeout exceeded" — pooler is down, retrying wastes another 8s.
 // Transparent to all controllers — no changes needed anywhere else.
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const _query = pool.query.bind(pool);
 pool.query = async function (...args) {
   try {
@@ -42,7 +44,8 @@ pool.query = async function (...args) {
       (err.message.includes("Connection terminated") || err.code === "ECONNRESET") &&
       !err.message.includes("timeout exceeded")
     ) {
-      console.warn("[pool] stale connection — retrying once:", err.message);
+      console.warn("[pool] stale connection — retrying in 300ms:", err.message);
+      await sleep(300);
       return await _query(...args);
     }
     throw err;
