@@ -67,4 +67,16 @@ pool.query("SELECT 1 AS ok")
     if (err.cause) console.error("[DB] Caused by:", err.cause.message);
   });
 
+// Pre-warm a second connection after 120s — by then min:1 is stable,
+// and a second warm connection handles simultaneous requests without waiting.
+setTimeout(async () => {
+  try {
+    const client = await pool.connect();
+    client.release();
+    console.log("[pool] second connection pre-warmed at 120s");
+  } catch (err) {
+    console.warn("[pool] second connection warmup failed:", err.message);
+  }
+}, 120 * 1000);
+
 module.exports = pool;
