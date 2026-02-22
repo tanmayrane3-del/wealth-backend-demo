@@ -14,10 +14,25 @@ const pool = new Pool({
   connectionTimeoutMillis: 30000,
 });
 
-// Prevent unhandled errors from crashing the process when
-// Supabase closes a connection that's sitting idle in the pool
 pool.on("error", (err) => {
   console.error("[pool] idle client error:", err.message);
 });
+
+pool.on("connect", () => {
+  console.log("[pool] new connection established");
+});
+
+pool.on("remove", () => {
+  console.log("[pool] connection removed from pool");
+});
+
+// Startup probe — logs exactly what succeeds or fails
+console.log(`[DB] Config: host=${process.env.DB_HOST} port=${process.env.DB_PORT} user=${process.env.DB_USER} db=${process.env.DB_NAME}`);
+pool.query("SELECT 1 AS ok")
+  .then(() => console.log("[DB] Startup connection test: OK"))
+  .catch((err) => {
+    console.error("[DB] Startup connection test FAILED:", err.message);
+    if (err.cause) console.error("[DB] Caused by:", err.cause.message);
+  });
 
 module.exports = pool;
