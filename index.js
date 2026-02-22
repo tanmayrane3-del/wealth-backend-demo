@@ -64,3 +64,16 @@ app.listen(PORT, () => {
     console.warn("[Keep-alive] RENDER_URL not set — self-ping disabled.");
   }
 });
+
+// Graceful shutdown — cleanly close DB pool before process exits.
+// Without this, Render kills the process abruptly, leaving dangling connections
+// in PgBouncer which overwhelms it during the next deployment's startup.
+const pool = require("./db");
+const shutdown = async (signal) => {
+  console.log(`[shutdown] ${signal} received — closing DB pool...`);
+  await pool.end();
+  console.log("[shutdown] DB pool closed. Exiting.");
+  process.exit(0);
+};
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
