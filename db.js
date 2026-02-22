@@ -22,12 +22,18 @@ pool.on("error", (err) => {
   console.error("[pool] idle client error:", err.message);
 });
 
-pool.on("connect", () => {
+const connectionTimes = new Map();
+
+pool.on("connect", (client) => {
+  connectionTimes.set(client, Date.now());
   console.log("[pool] new connection established");
 });
 
-pool.on("remove", () => {
-  console.log("[pool] connection removed from pool");
+pool.on("remove", (client) => {
+  const born = connectionTimes.get(client);
+  const lived = born ? Math.round((Date.now() - born) / 1000) : "?";
+  connectionTimes.delete(client);
+  console.log(`[pool] connection removed — lived ${lived}s`);
 });
 
 // Auto-retry once on stale PgBouncer connections (Connection terminated / ECONNRESET).
