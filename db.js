@@ -6,7 +6,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
   max: 3,
   idleTimeoutMillis: 10000,
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 30000,
   // Required for Supabase Transaction Pooler (PgBouncer)
   // PgBouncer doesn't support named prepared statements
   statement_cache_size: 0,
