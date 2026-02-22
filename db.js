@@ -9,9 +9,10 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
+  min: 1,             // always keep one warm connection — avoids cold-start burst failures
   max: 3,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 30000,
+  connectionTimeoutMillis: 8000,  // fail fast: 8s × 2 attempts = 16s max, not 60s
   // TCP keepalive — prevents NAT/firewall from silently dropping idle connections
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
@@ -29,7 +30,8 @@ pool.on("remove", () => {
   console.log("[pool] connection removed from pool");
 });
 
-// Auto-retry once on transient connection drops (stale PgBouncer connections).
+// Auto-retry once on stale PgBouncer connections (Connection terminated / ECONNRESET).
+// Does NOT retry "timeout exceeded" — that means the pooler is down; retrying wastes another 8s.
 // Transparent to all controllers — no changes needed anywhere else.
 const _query = pool.query.bind(pool);
 pool.query = async function (...args) {
@@ -37,11 +39,10 @@ pool.query = async function (...args) {
     return await _query(...args);
   } catch (err) {
     if (
-      err.message.includes("Connection terminated") ||
-      err.message.includes("timeout exceeded when trying to connect") ||
-      err.code === "ECONNRESET"
+      (err.message.includes("Connection terminated") || err.code === "ECONNRESET") &&
+      !err.message.includes("timeout exceeded")
     ) {
-      console.warn("[pool] transient connection error — retrying once:", err.message);
+      console.warn("[pool] stale connection — retrying once:", err.message);
       return await _query(...args);
     }
     throw err;
