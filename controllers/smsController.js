@@ -60,7 +60,7 @@ const parseSmsAndRecord = async (req, res) => {
     if (parsed.payment_identifier) {
       try {
         const sourceResult = await pool.query(
-          `SELECT id, name, default_category_id
+          `SELECT id, name, category_id
            FROM income_sources
            WHERE (user_id = $1 OR user_id IS NULL OR is_default = true)
              AND is_active = true
@@ -73,8 +73,8 @@ const parseSmsAndRecord = async (req, res) => {
           const source = sourceResult.rows[0];
           sourceId = source.id;
           sourceName = source.name;
-          if (source.default_category_id) {
-            incomeCategoryId = source.default_category_id;
+          if (source.category_id) {
+            incomeCategoryId = source.category_id;
           }
         }
       } catch (err) {
