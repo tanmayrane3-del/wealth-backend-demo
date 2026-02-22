@@ -1,15 +1,17 @@
 const { Pool } = require("pg");
 require("dotenv").config();
 
+// Use individual params so special chars in password don't break URL parsing
 const pool = new Pool({
-  connectionString: process.env.SUPABASE_URI,
+  host: process.env.DB_HOST,
+  port: parseInt(process.env.DB_PORT || "6543"),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
   max: 3,
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 30000,
-  // Required for Supabase Transaction Pooler (PgBouncer)
-  // PgBouncer doesn't support named prepared statements
-  statement_cache_size: 0,
 });
 
 // Prevent unhandled errors from crashing the process when
