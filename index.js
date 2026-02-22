@@ -1,3 +1,7 @@
+// Force IPv4 DNS resolution — Render free tier is IPv4-only but
+// Node.js 18+ defaults to verbatim order (prefers AAAA/IPv6 records first)
+require("dns").setDefaultResultOrder("ipv4first");
+
 const express = require("express");
 const https = require("https");
 const http = require("http");
