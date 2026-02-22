@@ -50,8 +50,8 @@ pool.query = async function (...args) {
       (err.message.includes("Connection terminated") || err.code === "ECONNRESET") &&
       !err.message.includes("timeout exceeded")
     ) {
-      console.warn("[pool] stale connection — retrying in 300ms:", err.message);
-      await sleep(300);
+      console.warn("[pool] stale connection — retrying in 2s:", err.message);
+      await sleep(2000);
       return await _query(...args);
     }
     throw err;
