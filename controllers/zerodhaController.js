@@ -180,11 +180,19 @@ const handleCallback = async (req, res) => {
 /**
  * GET /api/kite/auth/callback
  * Zerodha redirects here after user login.
- * Query params: request_token, status, state (= session token passed in auth URL)
- * No session middleware — user is identified via the state param.
+ * Query params: request_token, status
+ *
+ * Zerodha does NOT reliably echo back the `state` param, so we cannot
+ * identify the user server-side. Instead, this endpoint serves an HTML page
+ * that immediately redirects the browser to the custom app scheme
+ * wealthapp://auth/callback?request_token=xxx.
+ *
+ * Chrome Custom Tab intercepts the custom scheme, closes itself, and delivers
+ * onNewIntent to StocksActivity. The app then calls POST /api/zerodha/callback
+ * (session-protected) to exchange the request_token using its own credentials.
  */
-const handleKiteCallback = async (req, res) => {
-  const { request_token, status, state: session_token } = req.query;
+const handleKiteCallback = (req, res) => {
+  const { request_token, status } = req.query;
 
   if (status !== "success" || !request_token) {
     return res.status(400).send(`
@@ -195,111 +203,21 @@ const handleKiteCallback = async (req, res) => {
     `);
   }
 
-  if (!session_token) {
-    return res.status(400).send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-        <h2>Invalid Callback</h2>
-        <p>Missing state parameter. Please try again from the app.</p>
-      </body></html>
-    `);
-  }
+  const appUrl = `wealthapp://auth/callback?request_token=${encodeURIComponent(request_token)}`;
 
-  try {
-    // Resolve user_id from session token
-    const sessionResult = await pool.query(
-      `SELECT user_id FROM user_sessions
-       WHERE session_token = $1 AND is_active = true AND expires_at > NOW()`,
-      [session_token]
-    );
-
-    if (sessionResult.rows.length === 0) {
-      return res.status(401).send(`
-        <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-          <h2>Session Expired</h2>
-          <p>Your app session has expired. Please log in to the app and try again.</p>
-        </body></html>
-      `);
-    }
-
-    const user_id = sessionResult.rows[0].user_id;
-
-    const credResult = await pool.query(
-      `SELECT api_key, api_secret FROM zerodha_credentials WHERE user_id = $1 AND is_active = true`,
-      [user_id]
-    );
-
-    if (credResult.rows.length === 0) {
-      return res.status(404).send(`
-        <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-          <h2>Credentials Not Found</h2>
-          <p>Please save your Zerodha API key in the app first.</p>
-        </body></html>
-      `);
-    }
-
-    const { api_key, api_secret: encryptedSecret } = credResult.rows[0];
-    const api_secret = decrypt(encryptedSecret);
-
-    // SHA-256 checksum: sha256(api_key + request_token + api_secret)
-    const checksum = crypto
-      .createHash("sha256")
-      .update(api_key + request_token + api_secret)
-      .digest("hex");
-
-    // Exchange request_token for access_token
-    const kiteRes = await fetch(`${KITE_API_BASE}/session/token`, {
-      method: "POST",
-      headers: {
-        "X-Kite-Version": "3",
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: new URLSearchParams({ api_key, request_token, checksum })
-    });
-
-    const kiteBody = await kiteRes.json();
-
-    if (!kiteRes.ok || kiteBody.status !== "success") {
-      console.error("[Zerodha] Token exchange failed:", kiteBody);
-      return res.status(502).send(`
-        <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-          <h2>Authentication Failed</h2>
-          <p>${kiteBody.message || "Token exchange with Zerodha failed"}. Please try again.</p>
-        </body></html>
-      `);
-    }
-
-    const {
-      access_token,
-      user_id: zerodha_user_id,
-      user_name: zerodha_user_name
-    } = kiteBody.data;
-
-    await pool.query(
-      `UPDATE zerodha_credentials
-       SET access_token              = $1,
-           request_token             = $2,
-           access_token_generated_at = NOW(),
-           zerodha_user_id           = $3,
-           zerodha_user_name         = $4,
-           updated_at                = NOW()
-       WHERE user_id = $5`,
-      [access_token, request_token, zerodha_user_id, zerodha_user_name, user_id]
-    );
-
-    console.log(`[Zerodha] Auth successful for user ${user_id} (${zerodha_user_name})`);
-
-    // Redirect to custom app scheme — Chrome Custom Tab intercepts this,
-    // closes itself, and brings StocksActivity to the foreground via onNewIntent.
-    return res.redirect(`wealthapp://auth/success?user=${encodeURIComponent(zerodha_user_name)}`);
-  } catch (err) {
-    console.error("[Zerodha] Kite callback error:", err.message);
-    return res.status(500).send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-        <h2>Server Error</h2>
-        <p>Something went wrong. Please try again.</p>
-      </body></html>
-    `);
-  }
+  // Meta-refresh + JS double-redirect: ensures Chrome Custom Tab navigates to
+  // the custom scheme regardless of how the page is rendered.
+  return res.send(`
+    <html>
+      <head>
+        <meta http-equiv="refresh" content="0;url=${appUrl}">
+      </head>
+      <body style="font-family:sans-serif;text-align:center;padding:40px">
+        <p>Redirecting back to app…</p>
+        <script>window.location.href = '${appUrl}';</script>
+      </body>
+    </html>
+  `);
 };
 
 module.exports = { saveCredentials, getCredentials, getAuthUrl, handleCallback, handleKiteCallback };
