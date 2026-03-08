@@ -140,4 +140,32 @@ const getHoldings = async (req, res) => {
   }
 };
 
-module.exports = { syncHoldings, getHoldings };
+/**
+ * GET /api/holdings/summary
+ * Returns aggregated portfolio value and today's P&L for the dashboard.
+ */
+const getHoldingsSummary = async (req, res) => {
+  const user_id = req.user_id;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         COALESCE(SUM(current_value), 0)         AS total_portfolio_value,
+         COALESCE(SUM(day_change * quantity), 0) AS today_pnl
+       FROM stock_holdings
+       WHERE user_id = $1`,
+      [user_id]
+    );
+
+    const { total_portfolio_value, today_pnl } = result.rows[0];
+    return success(res, {
+      total_portfolio_value: parseFloat(total_portfolio_value),
+      today_pnl: parseFloat(today_pnl)
+    });
+  } catch (err) {
+    console.error("[Holdings] Summary error:", err.message);
+    return fail(res, "Failed to fetch holdings summary: " + err.message, 500);
+  }
+};
+
+module.exports = { syncHoldings, getHoldings, getHoldingsSummary };
