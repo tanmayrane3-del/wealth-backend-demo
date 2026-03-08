@@ -2,7 +2,9 @@
 
 > All requests require `x-session-token` header (your app session token).
 > Replace `YOUR_SESSION_TOKEN`, `YOUR_API_KEY`, `YOUR_API_SECRET`, `YOUR_REQUEST_TOKEN` with real values.
-> Base URL: `http://localhost:3000`
+>
+> **Production base URL:** `https://wealth-backend-demo.onrender.com`
+> **Local base URL:** `http://localhost:3000`
 
 ---
 
@@ -11,7 +13,7 @@
 Save your Zerodha `api_key` and `api_secret`. Done once. The `api_secret` is encrypted before storage.
 
 ```bash
-curl -X POST http://localhost:3000/api/zerodha/credentials \
+curl -X POST https://wealth-backend-demo.onrender.com/api/zerodha/credentials \
   -H "x-session-token: YOUR_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -32,12 +34,43 @@ curl -X POST http://localhost:3000/api/zerodha/credentials \
 
 ---
 
+## Step 1b — Get Saved Credentials (prefill UI)
+
+Returns the stored `api_key` and decrypted `api_secret` for the authenticated user.
+Used by the Android app to prefill the Connect Zerodha screen.
+
+```bash
+curl -X GET https://wealth-backend-demo.onrender.com/api/zerodha/credentials \
+  -H "x-session-token: YOUR_SESSION_TOKEN"
+```
+
+**Success response:**
+```json
+{
+  "status": "success",
+  "data": {
+    "api_key": "YOUR_API_KEY",
+    "api_secret": "YOUR_API_SECRET"
+  }
+}
+```
+
+**If no credentials saved yet:**
+```json
+{
+  "status": "fail",
+  "reason": "Zerodha credentials not found."
+}
+```
+
+---
+
 ## Step 2 — Get Login URL
 
 Fetch the Zerodha login URL. Your session token is automatically embedded as `state` so the backend can identify you when Zerodha redirects back.
 
 ```bash
-curl -X GET http://localhost:3000/api/zerodha/auth-url \
+curl -X GET https://wealth-backend-demo.onrender.com/api/zerodha/auth-url \
   -H "x-session-token: YOUR_SESSION_TOKEN"
 ```
 
@@ -71,9 +104,7 @@ The backend will:
 - Generate the SHA-256 checksum
 - Exchange `request_token` for `access_token` with Kite
 - Save `access_token` to the database
-- Show a success page in the browser
-
-The user sees: **"Zerodha Connected! You can close this window and return to the app."**
+- **Redirect to `wealthapp://auth/success`** — Chrome Custom Tab intercepts this custom scheme, closes itself, and delivers `onNewIntent` to `StocksActivity`, which then triggers a holdings sync
 
 > If `status=error` in the redirect, Zerodha login failed — try again.
 
@@ -90,6 +121,12 @@ GET https://wealth-backend-demo.onrender.com/api/kite/auth/callback
 
 No cURL needed. The browser handles this after the Zerodha login in Step 3.
 
+On success, the server responds with:
+```
+HTTP 302 → wealthapp://auth/success?user=ZERODHA_USER_NAME
+```
+This closes the Chrome Custom Tab and the Android app auto-syncs holdings.
+
 ---
 
 ## Step 5 — Sync Holdings (after successful login)
@@ -98,7 +135,7 @@ Fetches live holdings from Kite API and upserts into the database.
 Returns the synced holdings.
 
 ```bash
-curl -X GET http://localhost:3000/api/holdings/sync \
+curl -X GET https://wealth-backend-demo.onrender.com/api/holdings/sync \
   -H "x-session-token: YOUR_SESSION_TOKEN"
 ```
 
@@ -146,7 +183,7 @@ curl -X GET http://localhost:3000/api/holdings/sync \
 Reads holdings from your database without calling Zerodha.
 
 ```bash
-curl -X GET http://localhost:3000/api/holdings \
+curl -X GET https://wealth-backend-demo.onrender.com/api/holdings \
   -H "x-session-token: YOUR_SESSION_TOKEN"
 ```
 
@@ -167,6 +204,7 @@ curl -X GET http://localhost:3000/api/holdings \
 | Scenario | HTTP | reason |
 |---|---|---|
 | Missing `api_key` or `api_secret` in Step 1 | 400 | `api_key and api_secret are required` |
+| No credentials found (Step 1b) | 404 | `Zerodha credentials not found.` |
 | Credentials not saved before Step 2/4 | 404 | `Zerodha credentials not found...` |
 | Missing `request_token` in Step 4 | 400 | `request_token is required` |
 | Kite rejected the token exchange | 502 | Kite error message |

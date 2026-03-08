@@ -42,6 +42,33 @@ const saveCredentials = async (req, res) => {
 };
 
 /**
+ * GET /api/zerodha/credentials
+ * Returns the user's stored Zerodha API key and decrypted API secret.
+ */
+const getCredentials = async (req, res) => {
+  const user_id = req.user_id;
+
+  try {
+    const result = await pool.query(
+      `SELECT api_key, api_secret FROM zerodha_credentials WHERE user_id = $1 AND is_active = true`,
+      [user_id]
+    );
+
+    if (result.rows.length === 0) {
+      return fail(res, "Zerodha credentials not found.", 404);
+    }
+
+    const { api_key, api_secret: encryptedSecret } = result.rows[0];
+    const api_secret = decrypt(encryptedSecret);
+
+    return success(res, { api_key, api_secret });
+  } catch (err) {
+    console.error("[Zerodha] Get credentials error:", err.message);
+    return fail(res, "Failed to fetch credentials: " + err.message, 500);
+  }
+};
+
+/**
  * GET /api/zerodha/auth-url
  * Returns the Zerodha login URL for the authenticated user.
  */
@@ -261,12 +288,9 @@ const handleKiteCallback = async (req, res) => {
 
     console.log(`[Zerodha] Auth successful for user ${user_id} (${zerodha_user_name})`);
 
-    return res.send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-        <h2>Zerodha Connected!</h2>
-        <p>Welcome, <strong>${zerodha_user_name}</strong>. You can close this window and return to the app.</p>
-      </body></html>
-    `);
+    // Redirect to custom app scheme — Chrome Custom Tab intercepts this,
+    // closes itself, and brings StocksActivity to the foreground via onNewIntent.
+    return res.redirect(`wealthapp://auth/success?user=${encodeURIComponent(zerodha_user_name)}`);
   } catch (err) {
     console.error("[Zerodha] Kite callback error:", err.message);
     return res.status(500).send(`
@@ -278,4 +302,4 @@ const handleKiteCallback = async (req, res) => {
   }
 };
 
-module.exports = { saveCredentials, getAuthUrl, handleCallback, handleKiteCallback };
+module.exports = { saveCredentials, getCredentials, getAuthUrl, handleCallback, handleKiteCallback };
