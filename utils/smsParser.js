@@ -34,7 +34,7 @@ const SMS_PARSE_SCHEMA = {
     },
     time: {
       type: "string",
-      description: "Transaction time in HH:mm format. Use 00:00 if not in SMS."
+      description: "Transaction time in HH:mm format. Extract from SMS if present; otherwise use the time from the receivedDate field."
     },
     payment_method: {
       type: "string",
@@ -61,8 +61,8 @@ Rules:
 - For debit/UPI payments, payment_identifier is the recipient UPI ID e.g. 'paytmqr@paytm' or 'merchant@upi'.
 - For debit/card payments, payment_identifier is the merchant name.
 - For credit transactions, payment_identifier is the sender's UPI ID, name, or company identifier if present in the SMS.
-- Extract date from SMS if present; otherwise use the receivedDate field provided.
-- Extract time from SMS if present; otherwise use 00:00.
+- Extract date from SMS if present; otherwise use the date from the receivedDate field provided.
+- Extract time from SMS if present; otherwise extract the time (HH:mm) from the receivedDate field provided.
 - amount must NOT include currency symbols — just digits and decimal point e.g. '500.00'.
 - All string fields should be null (not the string "null") if not found.`;
 

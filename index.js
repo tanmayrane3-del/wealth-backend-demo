@@ -24,6 +24,9 @@ const recipientsRoutes = require("./routes/recipients");
 const paymentMethodsRoutes = require("./routes/paymentMethods");
 const smsRoutes = require("./routes/sms");
 const adminRoutes = require("./routes/admin");
+const zerodhaRoutes = require("./routes/zerodha");
+const holdingsRoutes = require("./routes/holdings");
+const kiteRoutes = require("./routes/kite");
 
 // Use routes
 app.use("/api/users", userRoutes);
@@ -38,6 +41,9 @@ app.use("/api/recipients", recipientsRoutes);
 app.use("/api/payment-methods", paymentMethodsRoutes);
 app.use("/api/sms", smsRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/zerodha", zerodhaRoutes);
+app.use("/api/holdings", holdingsRoutes);
+app.use("/api/kite", kiteRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
