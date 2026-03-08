@@ -53,6 +53,10 @@ app.get("/health", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 
+  // Start automated market-hours holdings sync
+  const { initMarketSync } = require("./services/marketSync");
+  initMarketSync();
+
   // Self-ping every 14 minutes to prevent Render from sleeping
   const RENDER_URL = process.env.RENDER_URL;
   if (RENDER_URL) {
