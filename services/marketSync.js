@@ -170,7 +170,7 @@ async function runMarketSync() {
     users = result.rows;
   } catch (err) {
     console.error("[MarketSync] Failed to fetch users:", err.message);
-    return;
+    return false;
   }
 
   console.log(`[MarketSync] ${users.length} user(s) to sync`);
@@ -222,6 +222,7 @@ async function runMarketSync() {
   }
 
   console.log(`[MarketSync] Sync run complete. ${processed}/${users.length} users synced.`);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,8 +243,19 @@ function initMarketSync() {
   });
 
   // Final sync: 15:35 IST = 10:05 UTC, Monday–Friday
+  // If the DB is unreachable, retries every 5 minutes until it succeeds.
   cron.schedule("5 10 * * 1-5", async () => {
-    await runMarketSync();
+    const succeeded = await runMarketSync();
+    if (!succeeded) {
+      console.log("[MarketSync] Final sync failed — retrying every 5min until success");
+      const retryInterval = setInterval(async () => {
+        const retryOk = await runMarketSync();
+        if (retryOk) {
+          console.log("[MarketSync] Final sync retry succeeded — stopping retries");
+          clearInterval(retryInterval);
+        }
+      }, 5 * 60 * 1000);
+    }
   });
 
   console.log("[MarketSync] Cron jobs initialized — every 5min (market hours) + final at 15:35 IST");
