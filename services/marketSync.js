@@ -133,14 +133,17 @@ async function syncUserHoldings(user_id, api_key, access_token) {
 
   for (const h of holdings) await upsertHolding(h);
 
-  // Delete rows that are no longer in Kite holdings (sold stocks, stale data)
+  // Delete rows whose (tradingsymbol, exchange) pair is no longer in Kite holdings
   if (holdings.length > 0) {
-    const symbols = holdings.map(h => h.tradingsymbol);
+    const symbols  = holdings.map(h => h.tradingsymbol);
+    const exchanges = holdings.map(h => h.exchange);
     await pool.query(
       `DELETE FROM stock_holdings
        WHERE user_id = $1
-         AND tradingsymbol != ALL($2::text[])`,
-      [user_id, symbols]
+         AND (tradingsymbol, exchange) NOT IN (
+           SELECT * FROM unnest($2::text[], $3::text[])
+         )`,
+      [user_id, symbols, exchanges]
     );
   }
 
