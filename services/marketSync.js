@@ -62,19 +62,7 @@ async function syncUserHoldings(user_id, api_key, access_token) {
     throw new Error(`Kite holdings error: ${holdingsBody.message || holdingsRes.status}`);
   }
 
-  // ── Positions ─────────────────────────────────────────────────────────────
-  const positionsRes = await fetch(`${KITE_API_BASE}/portfolio/positions`, { headers });
-  const positionsBody = await positionsRes.json();
-
-  if (positionsBody.error_type === "TokenException") {
-    throw new Error("TOKEN_EXCEPTION");
-  }
-  if (!positionsRes.ok || positionsBody.status !== "success") {
-    throw new Error(`Kite positions error: ${positionsBody.message || positionsRes.status}`);
-  }
-
   const holdings = holdingsBody.data ?? [];
-  const positions = positionsBody.data?.net ?? [];
 
   // ── Upsert helper ─────────────────────────────────────────────────────────
   const upsertHolding = async (h) => {
@@ -144,9 +132,19 @@ async function syncUserHoldings(user_id, api_key, access_token) {
   };
 
   for (const h of holdings) await upsertHolding(h);
-  for (const p of positions) await upsertHolding(p);
 
-  return { holdingsSynced: holdings.length, positionsSynced: positions.length };
+  // Delete rows that are no longer in Kite holdings (sold stocks, stale data)
+  if (holdings.length > 0) {
+    const symbols = holdings.map(h => h.tradingsymbol);
+    await pool.query(
+      `DELETE FROM stock_holdings
+       WHERE user_id = $1
+         AND tradingsymbol != ALL($2::text[])`,
+      [user_id, symbols]
+    );
+  }
+
+  return { holdingsSynced: holdings.length };
 }
 
 // ---------------------------------------------------------------------------

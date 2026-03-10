@@ -107,6 +107,17 @@ const syncHoldings = async (req, res) => {
       );
     }
 
+    // Remove stocks no longer in Kite holdings (sold / stale positions data)
+    if (holdings.length > 0) {
+      const symbols = holdings.map(h => h.tradingsymbol);
+      await pool.query(
+        `DELETE FROM stock_holdings
+         WHERE user_id = $1
+           AND tradingsymbol != ALL($2::text[])`,
+        [user_id, symbols]
+      );
+    }
+
     // Return the freshly synced holdings from DB
     const dbResult = await pool.query(
       `SELECT * FROM stock_holdings WHERE user_id = $1 ORDER BY tradingsymbol`,
