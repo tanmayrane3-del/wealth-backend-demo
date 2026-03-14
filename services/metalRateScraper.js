@@ -4,7 +4,7 @@ const pool = require("../db");
 const CACHE_TTL_MINUTES = 720; // 12 hours
 
 // Free, no-auth APIs that work from server environments
-const METALS_LIVE_URL   = "https://api.metals.live/v1/spot/gold"; // USD per troy oz
+const YAHOO_GOLD_URL    = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1d"; // gold futures USD/oz
 const EXCHANGE_RATE_URL = "https://open.er-api.com/v6/latest/USD"; // USD → INR
 
 const TROY_OZ_TO_GRAMS = 31.1035;
@@ -39,7 +39,7 @@ async function getLatestRates() {
 
   const insertResult = await pool.query(
     `INSERT INTO metal_rates_cache (gold_22k_per_gram, gold_24k_per_gram, source, fetched_at)
-     VALUES ($1, $2, 'metals.live+openexchange', NOW())
+     VALUES ($1, $2, 'yahoo-finance+openexchange', NOW())
      RETURNING fetched_at`,
     [rates.gold_22k_per_gram, rates.gold_24k_per_gram]
   );
@@ -52,26 +52,23 @@ async function getLatestRates() {
 
 /**
  * Fetches live gold rates via:
- *   1. metals.live  — gold spot price in USD / troy oz
- *   2. open.er-api  — USD → INR exchange rate
+ *   1. Yahoo Finance (GC=F) — gold futures price in USD / troy oz
+ *   2. open.er-api          — USD → INR exchange rate
  *
  * Conversion:
  *   24K/gram (INR) = (gold_usd_per_troyoz × usd_inr) / 31.1035
  *   22K/gram (INR) = 24K/gram × (22/24)
- *
- * Note: Indian market 22K/24K retail rates carry a small making-charge
- * premium over spot, but spot-derived rates are accurate for valuation.
  */
 async function fetchLiveRates() {
   const [goldRes, fxRes] = await Promise.all([
-    axios.get(METALS_LIVE_URL,   { timeout: 10000 }),
+    axios.get(YAHOO_GOLD_URL,    { timeout: 10000, headers: { "User-Agent": "Mozilla/5.0" } }),
     axios.get(EXCHANGE_RATE_URL, { timeout: 10000 }),
   ]);
 
-  // metals.live returns: { "price": 3158.12 }
-  const goldUsdPerTroyOz = goldRes.data?.price;
+  // Yahoo Finance returns: chart.result[0].meta.regularMarketPrice (USD/oz)
+  const goldUsdPerTroyOz = goldRes.data?.chart?.result?.[0]?.meta?.regularMarketPrice;
   if (!goldUsdPerTroyOz || isNaN(goldUsdPerTroyOz)) {
-    throw new Error(`Unexpected response from metals.live: ${JSON.stringify(goldRes.data)}`);
+    throw new Error(`Unexpected response from Yahoo Finance: ${JSON.stringify(goldRes.data?.chart?.result?.[0]?.meta)}`);
   }
 
   // open.er-api returns: { "rates": { "INR": 85.42, ... } }
