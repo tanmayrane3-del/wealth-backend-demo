@@ -1,7 +1,7 @@
 const axios = require("axios");
 const pool = require("../db");
 
-const CACHE_TTL_MINUTES = 30;
+const CACHE_TTL_MINUTES = 720; // 12 hours
 
 // Free, no-auth APIs that work from server environments
 const METALS_LIVE_URL   = "https://api.metals.live/v1/spot/gold"; // USD per troy oz
