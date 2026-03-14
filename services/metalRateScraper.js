@@ -1,13 +1,16 @@
 const axios = require("axios");
-const cheerio = require("cheerio");
 const pool = require("../db");
 
 const CACHE_TTL_MINUTES = 30;
-const SCRAPE_URL = "https://www.goodreturns.in/gold-rates-in-india.html";
+
+// Free, no-auth APIs that work from server environments
+const METALS_LIVE_URL   = "https://api.metals.live/v1/spot/gold"; // USD per troy oz
+const EXCHANGE_RATE_URL = "https://open.er-api.com/v6/latest/USD"; // USD → INR
+
+const TROY_OZ_TO_GRAMS = 31.1035;
 
 /**
- * Returns cached rates if fresh (< 30 min), otherwise scrapes GoodReturns
- * and inserts a new cache row.
+ * Returns cached rates if fresh (< 30 min), otherwise fetches from API.
  * @returns {{ gold_22k_per_gram: number, gold_24k_per_gram: number, fetched_at: string }}
  */
 async function getLatestRates() {
@@ -31,13 +34,12 @@ async function getLatestRates() {
     }
   }
 
-  // Cache is stale or empty — scrape GoodReturns
-  const rates = await scrapeGoodReturns();
+  // Cache is stale or empty — fetch from API
+  const rates = await fetchLiveRates();
 
-  // Insert new cache row
   const insertResult = await pool.query(
     `INSERT INTO metal_rates_cache (gold_22k_per_gram, gold_24k_per_gram, source, fetched_at)
-     VALUES ($1, $2, 'goodreturns', NOW())
+     VALUES ($1, $2, 'metals.live+openexchange', NOW())
      RETURNING fetched_at`,
     [rates.gold_22k_per_gram, rates.gold_24k_per_gram]
   );
@@ -49,72 +51,42 @@ async function getLatestRates() {
 }
 
 /**
- * Scrapes Mumbai gold rates from GoodReturns.
- * Targets the "Gold Rates in Mumbai" section of the rates table.
+ * Fetches live gold rates via:
+ *   1. metals.live  — gold spot price in USD / troy oz
+ *   2. open.er-api  — USD → INR exchange rate
+ *
+ * Conversion:
+ *   24K/gram (INR) = (gold_usd_per_troyoz × usd_inr) / 31.1035
+ *   22K/gram (INR) = 24K/gram × (22/24)
+ *
+ * Note: Indian market 22K/24K retail rates carry a small making-charge
+ * premium over spot, but spot-derived rates are accurate for valuation.
  */
-async function scrapeGoodReturns() {
-  const response = await axios.get(SCRAPE_URL, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "en-IN,en;q=0.9",
-    },
-    timeout: 15000,
-  });
+async function fetchLiveRates() {
+  const [goldRes, fxRes] = await Promise.all([
+    axios.get(METALS_LIVE_URL,   { timeout: 10000 }),
+    axios.get(EXCHANGE_RATE_URL, { timeout: 10000 }),
+  ]);
 
-  const $ = cheerio.load(response.data);
-  let gold22k = null;
-  let gold24k = null;
-
-  // GoodReturns gold page has a table with city-wise rates.
-  // Each row: City | 22K (1g) | 24K (1g) | ...
-  // Look for the row containing "Mumbai"
-  $("table tbody tr").each((_, row) => {
-    const cells = $(row).find("td");
-    if (cells.length < 3) return;
-
-    const cityText = $(cells[0]).text().trim().toLowerCase();
-    if (!cityText.includes("mumbai")) return;
-
-    const raw22k = $(cells[1]).text().trim().replace(/[₹,\s]/g, "");
-    const raw24k = $(cells[2]).text().trim().replace(/[₹,\s]/g, "");
-
-    const parsed22k = parseFloat(raw22k);
-    const parsed24k = parseFloat(raw24k);
-
-    if (!isNaN(parsed22k) && parsed22k > 0) gold22k = parsed22k;
-    if (!isNaN(parsed24k) && parsed24k > 0) gold24k = parsed24k;
-
-    return false; // break out of each loop
-  });
-
-  // Fallback: try alternate table structure if above didn't work
-  if (!gold22k || !gold24k) {
-    $("tr").each((_, row) => {
-      const cells = $(row).find("td");
-      if (cells.length < 3) return;
-
-      const cityText = $(cells[0]).text().trim().toLowerCase();
-      if (!cityText.includes("mumbai")) return;
-
-      const raw22k = $(cells[1]).text().trim().replace(/[₹,\s]/g, "");
-      const raw24k = $(cells[2]).text().trim().replace(/[₹,\s]/g, "");
-
-      const parsed22k = parseFloat(raw22k);
-      const parsed24k = parseFloat(raw24k);
-
-      if (!isNaN(parsed22k) && parsed22k > 0) gold22k = parsed22k;
-      if (!isNaN(parsed24k) && parsed24k > 0) gold24k = parsed24k;
-
-      return false;
-    });
+  // metals.live returns: { "price": 3158.12 }
+  const goldUsdPerTroyOz = goldRes.data?.price;
+  if (!goldUsdPerTroyOz || isNaN(goldUsdPerTroyOz)) {
+    throw new Error(`Unexpected response from metals.live: ${JSON.stringify(goldRes.data)}`);
   }
 
-  if (!gold22k || !gold24k) {
-    throw new Error("Failed to extract gold rates from GoodReturns — page structure may have changed");
+  // open.er-api returns: { "rates": { "INR": 85.42, ... } }
+  const usdToInr = fxRes.data?.rates?.INR;
+  if (!usdToInr || isNaN(usdToInr)) {
+    throw new Error(`Unexpected response from open.er-api: ${JSON.stringify(fxRes.data)}`);
   }
 
-  console.log(`[MetalRateScraper] Scraped rates — 22K: ₹${gold22k}/g, 24K: ₹${gold24k}/g`);
+  const gold24k = parseFloat(((goldUsdPerTroyOz * usdToInr) / TROY_OZ_TO_GRAMS).toFixed(2));
+  const gold22k = parseFloat((gold24k * (22 / 24)).toFixed(2));
+
+  console.log(
+    `[MetalRates] Fetched — spot: $${goldUsdPerTroyOz}/oz, ` +
+    `USD/INR: ${usdToInr}, 24K: ₹${gold24k}/g, 22K: ₹${gold22k}/g`
+  );
 
   return {
     gold_22k_per_gram: gold22k,
