@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { getValidAccessToken } = require("../middleware/zerodhaAuth");
 const { success, fail } = require("../utils/respond");
+const { ensureMissingStocksCagr } = require("../services/cagrCalculator");
 
 const KITE_API_BASE = process.env.KITE_API_BASE_URL || "https://api.kite.trade";
 
@@ -130,6 +131,12 @@ const syncHoldings = async (req, res) => {
        WHERE sh.user_id = $1
        ORDER BY sh.tradingsymbol`,
       [user_id]
+    );
+
+    // Fire-and-forget: compute CAGR for any newly synced stocks not yet in asset_cagr
+    const syncedStocks = dbResult.rows.map((r) => ({ tradingsymbol: r.tradingsymbol, exchange: r.exchange }));
+    ensureMissingStocksCagr(syncedStocks).catch((err) =>
+      console.error("[Holdings] CAGR backfill error:", err.message)
     );
 
     return success(res, { synced: holdings.length, holdings: dbResult.rows });

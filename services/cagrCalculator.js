@@ -599,4 +599,41 @@ function initCagrScheduler() {
   console.log("[CAGR] Weekly scheduler initialized — runs Sunday 23:00 IST (17:30 UTC)");
 }
 
-module.exports = { initCagrScheduler, runCagrJob };
+// ---------------------------------------------------------------------------
+// On-demand backfill for missing stocks (called after holdings sync)
+// ---------------------------------------------------------------------------
+
+/**
+ * Checks which of the provided stocks are absent from asset_cagr and
+ * computes CAGR only for those. Safe to fire-and-forget — errors are caught.
+ * @param {Array<{tradingsymbol: string, exchange: string}>} stocks
+ */
+async function ensureMissingStocksCagr(stocks) {
+  if (!stocks || stocks.length === 0) return;
+
+  const symbols = stocks.map((s) => s.tradingsymbol);
+
+  const existing = await pool.query(
+    `SELECT symbol FROM asset_cagr WHERE symbol = ANY($1) AND asset_type = 'stock'`,
+    [symbols]
+  );
+  const existingSet = new Set(existing.rows.map((r) => r.symbol));
+
+  const missing = stocks.filter((s) => !existingSet.has(s.tradingsymbol));
+  if (missing.length === 0) {
+    console.log("[CAGR/Backfill] All synced stocks already have CAGR data");
+    return;
+  }
+
+  console.log(
+    `[CAGR/Backfill] Computing CAGR for ${missing.length} new stock(s): ` +
+    missing.map((s) => s.tradingsymbol).join(", ")
+  );
+
+  const rows = await processStocks(missing);
+  if (rows.length > 0) await upsertCagrRows(rows);
+
+  console.log(`[CAGR/Backfill] Done — inserted CAGR for ${rows.length} stock(s)`);
+}
+
+module.exports = { initCagrScheduler, runCagrJob, ensureMissingStocksCagr };
