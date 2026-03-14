@@ -79,22 +79,24 @@ Received: ${receivedDate}
 SMS: ${body}`;
 
   const response = await client.messages.create({
-    model: "claude-haiku-4-5",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 512,
     system: SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
-    output_config: {
-      format: {
-        type: "json_schema",
-        schema: SMS_PARSE_SCHEMA
-      }
-    }
+    tools: [{
+      name: "parse_sms",
+      description: "Extract transaction details from a bank SMS message",
+      input_schema: SMS_PARSE_SCHEMA
+    }],
+    tool_choice: { type: "tool", name: "parse_sms" }
   });
 
   const { input_tokens, output_tokens } = response.usage;
   console.log(`[Haiku usage] input=${input_tokens} output=${output_tokens} total=${input_tokens + output_tokens} tokens`);
 
-  return JSON.parse(response.content[0].text);
+  const toolUse = response.content.find(b => b.type === "tool_use");
+  if (!toolUse) throw new Error("No tool_use block in Claude response");
+  return toolUse.input;
 }
 
 module.exports = { parseSms };

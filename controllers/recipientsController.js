@@ -49,10 +49,23 @@ const getRecipients = async (req, res) => {
   }
 };
 
+// Helper: parse payment_identifiers array or legacy payment_identifier string into pipe-joined value
+function resolvePaymentIdentifier(body) {
+  if (Array.isArray(body.payment_identifiers)) {
+    if (body.payment_identifiers.length > 5) {
+      return { error: "Maximum 5 payment identifiers allowed" };
+    }
+    const clean = body.payment_identifiers.map(s => String(s).trim()).filter(Boolean);
+    return { value: clean.length > 0 ? clean.join("|") : null };
+  }
+  // Legacy single string field
+  return { value: body.payment_identifier || null };
+}
+
 // Create a new recipient for the user
 const createRecipient = async (req, res) => {
   const user_id = req.user_id;
-  const { name, type, description, contact_info, is_favorite, payment_identifier, category_id } = req.body;
+  const { name, type, description, contact_info, is_favorite, category_id } = req.body;
 
   if (!name) {
     return res.status(400).json({
@@ -60,6 +73,11 @@ const createRecipient = async (req, res) => {
       timestamp: new Date().toISOString(),
       reason: "Name is required"
     });
+  }
+
+  const { value: paymentIdentifierValue, error: piError } = resolvePaymentIdentifier(req.body);
+  if (piError) {
+    return res.status(400).json({ status: "fail", timestamp: new Date().toISOString(), reason: piError });
   }
 
   try {
@@ -90,7 +108,7 @@ const createRecipient = async (req, res) => {
                 is_favorite, is_default, is_global, is_active,
                 payment_identifier, category_id, created_at`,
       [user_id, name, type || null, description || null, contact_info || null,
-       is_favorite || false, payment_identifier || null, category_id || null]
+       is_favorite || false, paymentIdentifierValue, category_id || null]
     );
 
     res.status(201).json({
@@ -112,7 +130,7 @@ const createRecipient = async (req, res) => {
 const updateRecipient = async (req, res) => {
   const user_id = req.user_id;
   const { id } = req.params;
-  const { name, type, description, contact_info, is_favorite, is_active, payment_identifier, category_id } = req.body;
+  const { name, type, description, contact_info, is_favorite, is_active, category_id } = req.body;
 
   try {
     // Check if recipient exists
@@ -149,6 +167,11 @@ const updateRecipient = async (req, res) => {
       });
     }
 
+    const { value: paymentIdentifierValue, error: piError } = resolvePaymentIdentifier(req.body);
+    if (piError) {
+      return res.status(400).json({ status: "fail", timestamp: new Date().toISOString(), reason: piError });
+    }
+
     // If name is being changed, check for duplicates
     if (name) {
       const duplicateCheck = await pool.query(
@@ -177,7 +200,7 @@ const updateRecipient = async (req, res) => {
            contact_info = COALESCE($4, contact_info),
            is_favorite = COALESCE($5, is_favorite),
            is_active = COALESCE($6, is_active),
-           payment_identifier = COALESCE($7, payment_identifier),
+           payment_identifier = $7,
            category_id = COALESCE($8, category_id),
            updated_at = NOW()
        WHERE id = $9 AND user_id = $10
@@ -185,7 +208,7 @@ const updateRecipient = async (req, res) => {
                  is_favorite, is_default, is_global, is_active,
                  payment_identifier, category_id, updated_at`,
       [name, type, description, contact_info, is_favorite, is_active,
-       payment_identifier, category_id, id, user_id]
+       paymentIdentifierValue, category_id, id, user_id]
     );
 
     res.json({
@@ -317,7 +340,8 @@ const getRecipientByPaymentIdentifier = async (req, res) => {
       FROM recipients r
       WHERE (r.user_id = $1 OR r.user_id IS NULL OR r.is_default = true)
         AND r.is_active = true
-        AND LOWER(r.payment_identifier) = LOWER($2)
+        AND r.payment_identifier IS NOT NULL
+        AND LOWER($2) = ANY(string_to_array(LOWER(r.payment_identifier), '|'))
       LIMIT 1`,
       [user_id, payment_identifier]
     );
