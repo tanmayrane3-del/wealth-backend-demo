@@ -2,9 +2,9 @@ const cron    = require("node-cron");
 const axios   = require("axios");
 const pool    = require("../db");
 
-// yahoo-finance2 suppresses its own validation warnings; we use it only for
-// historical prices and quote data.
-const yf = require("yahoo-finance2").default;
+// yahoo-finance2 v3 requires instantiation via `new`.
+const YahooFinance = require("yahoo-finance2").default;
+const yf = new YahooFinance({ suppressNotices: ["yahooSurvey", "ripHistorical"] });
 
 // ---------------------------------------------------------------------------
 // Config & Constants
