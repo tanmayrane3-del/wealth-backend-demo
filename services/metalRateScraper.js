@@ -8,6 +8,7 @@ const YAHOO_GOLD_URL    = "https://query1.finance.yahoo.com/v8/finance/chart/GC=
 const EXCHANGE_RATE_URL = "https://open.er-api.com/v6/latest/USD"; // USD → INR
 
 const TROY_OZ_TO_GRAMS = 31.1035;
+const INDIA_IMPORT_DUTY = 1.06; // 6% import duty on gold
 
 /**
  * Returns cached rates if fresh (< 30 min), otherwise fetches from API.
@@ -77,7 +78,7 @@ async function fetchLiveRates() {
     throw new Error(`Unexpected response from open.er-api: ${JSON.stringify(fxRes.data)}`);
   }
 
-  const gold24k = parseFloat(((goldUsdPerTroyOz * usdToInr) / TROY_OZ_TO_GRAMS).toFixed(2));
+  const gold24k = parseFloat(((goldUsdPerTroyOz * usdToInr) / TROY_OZ_TO_GRAMS * INDIA_IMPORT_DUTY).toFixed(2));
   const gold22k = parseFloat((gold24k * (22 / 24)).toFixed(2));
 
   console.log(
