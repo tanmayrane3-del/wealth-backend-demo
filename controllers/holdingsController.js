@@ -121,9 +121,14 @@ const syncHoldings = async (req, res) => {
       );
     }
 
-    // Return the freshly synced holdings from DB
+    // Return the freshly synced holdings from DB (with CAGR if available)
     const dbResult = await pool.query(
-      `SELECT * FROM stock_holdings WHERE user_id = $1 ORDER BY tradingsymbol`,
+      `SELECT sh.*, ac.cagr_1y
+       FROM stock_holdings sh
+       LEFT JOIN asset_cagr ac
+         ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
+       WHERE sh.user_id = $1
+       ORDER BY sh.tradingsymbol`,
       [user_id]
     );
 
@@ -143,7 +148,12 @@ const getHoldings = async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT * FROM stock_holdings WHERE user_id = $1 ORDER BY tradingsymbol`,
+      `SELECT sh.*, ac.cagr_1y
+       FROM stock_holdings sh
+       LEFT JOIN asset_cagr ac
+         ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
+       WHERE sh.user_id = $1
+       ORDER BY sh.tradingsymbol`,
       [user_id]
     );
 
