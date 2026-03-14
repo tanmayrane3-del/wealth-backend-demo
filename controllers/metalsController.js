@@ -1,6 +1,6 @@
 const pool = require("../db");
 const { success, fail } = require("../utils/respond");
-const { getLatestRates } = require("../services/metalRateScraper");
+const { getLatestRates, fetchGoldDayChangePct } = require("../services/metalRateScraper");
 
 const VALID_METAL_TYPES = ["physical_gold", "digital_gold", "sgb"];
 const VALID_SUB_TYPES   = ["jewellery", "coins", "bars"];
@@ -20,42 +20,52 @@ const getRates = async (req, res) => {
 // ─── GET /api/metals/holdings ──────────────────────────────────────────────
 const getHoldings = async (req, res) => {
   try {
-    const rates = await getLatestRates();
-    const { gold_22k_per_gram, gold_24k_per_gram } = rates;
+    const [rates, dayChangePct, result] = await Promise.all([
+      getLatestRates(),
+      fetchGoldDayChangePct().catch(() => 0),
+      pool.query(
+        `SELECT id, metal_type, sub_type, label, quantity_grams, purity, notes, created_at, updated_at
+         FROM metal_holdings
+         WHERE user_id = $1
+         ORDER BY metal_type, created_at`,
+        [req.user_id]
+      ),
+    ]);
 
-    const result = await pool.query(
-      `SELECT id, metal_type, sub_type, label, quantity_grams, purity, notes, created_at, updated_at
-       FROM metal_holdings
-       WHERE user_id = $1
-       ORDER BY metal_type, created_at`,
-      [req.user_id]
-    );
+    const { gold_22k_per_gram, gold_24k_per_gram } = rates;
 
     const holdings = result.rows.map((h) => {
       const qty  = parseFloat(h.quantity_grams);
       const rate = h.metal_type === "physical_gold" && h.purity === "22k"
         ? gold_22k_per_gram
         : gold_24k_per_gram;
+      const current_value = parseFloat((qty * rate).toFixed(2));
+      // day_change = current_value - prev_value; prev_value = current_value / (1 + pct)
+      const day_change = parseFloat((current_value - current_value / (1 + dayChangePct)).toFixed(2));
 
       return {
-        id:            h.id,
-        metal_type:    h.metal_type,
-        sub_type:      h.sub_type,
-        label:         h.label,
+        id:             h.id,
+        metal_type:     h.metal_type,
+        sub_type:       h.sub_type,
+        label:          h.label,
         quantity_grams: qty,
-        purity:        h.purity,
-        notes:         h.notes,
-        current_value: parseFloat((qty * rate).toFixed(2)),
-        created_at:    h.created_at,
-        updated_at:    h.updated_at,
+        purity:         h.purity,
+        notes:          h.notes,
+        current_value,
+        day_change,
+        created_at:     h.created_at,
+        updated_at:     h.updated_at,
       };
     });
 
     const total_value = parseFloat(
       holdings.reduce((sum, h) => sum + h.current_value, 0).toFixed(2)
     );
+    const total_day_pnl = parseFloat(
+      holdings.reduce((sum, h) => sum + h.day_change, 0).toFixed(2)
+    );
 
-    return success(res, { holdings, total_value, rates });
+    return success(res, { holdings, total_value, total_day_pnl, rates });
   } catch (err) {
     console.error("[metals/holdings GET] Error:", err.message);
     return fail(res, err.message, 500);

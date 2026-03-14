@@ -92,4 +92,23 @@ async function fetchLiveRates() {
   };
 }
 
-module.exports = { getLatestRates };
+/**
+ * Returns today's price-change fraction for gold (current vs previous close).
+ * Always fetched live — not cached — since day change updates throughout the day.
+ * @returns {Promise<number>} e.g. 0.012 for +1.2%, -0.008 for -0.8%
+ */
+async function fetchGoldDayChangePct() {
+  const goldRes = await axios.get(YAHOO_GOLD_URL, {
+    timeout: 10000,
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+  const meta = goldRes.data?.chart?.result?.[0]?.meta;
+  const current   = meta?.regularMarketPrice;
+  const prevClose = meta?.chartPreviousClose;
+  if (!current || !prevClose || isNaN(current) || isNaN(prevClose) || prevClose === 0) {
+    return 0;
+  }
+  return (current - prevClose) / prevClose;
+}
+
+module.exports = { getLatestRates, fetchGoldDayChangePct };
