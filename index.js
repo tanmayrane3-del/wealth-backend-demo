@@ -28,6 +28,7 @@ const zerodhaRoutes = require("./routes/zerodha");
 const holdingsRoutes = require("./routes/holdings");
 const kiteRoutes = require("./routes/kite");
 const metalsRoutes = require("./routes/metals");
+const cagrRoutes   = require("./routes/cagr");
 
 // Use routes
 app.use("/api/users", userRoutes);
@@ -46,6 +47,7 @@ app.use("/api/zerodha", zerodhaRoutes);
 app.use("/api/holdings", holdingsRoutes);
 app.use("/api/kite", kiteRoutes);
 app.use("/api/metals", metalsRoutes);
+app.use("/api/cagr",   cagrRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -58,6 +60,10 @@ app.listen(PORT, () => {
   // Start automated market-hours holdings sync
   const { initMarketSync } = require("./services/marketSync");
   initMarketSync();
+
+  // Weekly CAGR calculation job (every Sunday 23:00 IST)
+  const { initCagrScheduler } = require("./services/cagrCalculator");
+  initCagrScheduler();
 
   // Self-ping every 14 minutes to prevent Render from sleeping
   const RENDER_URL = process.env.RENDER_URL;
