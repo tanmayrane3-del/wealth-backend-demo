@@ -183,17 +183,25 @@ const getHoldingsSummary = async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
-         COALESCE(SUM(current_value), 0)         AS total_portfolio_value,
-         COALESCE(SUM(day_change * quantity), 0) AS today_pnl
-       FROM stock_holdings
-       WHERE user_id = $1`,
+         COALESCE(SUM(sh.current_value), 0)                                    AS total_portfolio_value,
+         COALESCE(SUM(sh.day_change * sh.quantity), 0)                         AS today_pnl,
+         COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_1y, 1.0)), 0) AS projected_1y,
+         COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_3y, 1.0)), 0) AS projected_3y,
+         COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_5y, 1.0)), 0) AS projected_5y
+       FROM stock_holdings sh
+       LEFT JOIN asset_cagr ac
+         ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
+       WHERE sh.user_id = $1`,
       [user_id]
     );
 
-    const { total_portfolio_value, today_pnl } = result.rows[0];
+    const { total_portfolio_value, today_pnl, projected_1y, projected_3y, projected_5y } = result.rows[0];
     return success(res, {
       total_portfolio_value: parseFloat(total_portfolio_value),
-      today_pnl: parseFloat(today_pnl)
+      today_pnl: parseFloat(today_pnl),
+      projected_1y: parseFloat(projected_1y),
+      projected_3y: parseFloat(projected_3y),
+      projected_5y: parseFloat(projected_5y)
     });
   } catch (err) {
     console.error("[Holdings] Summary error:", err.message);
