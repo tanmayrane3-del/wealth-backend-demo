@@ -166,12 +166,6 @@ const getHoldings = async (req, res) => {
       [user_id]
     );
 
-    // Fire-and-forget: compute CAGR for any stocks not yet in asset_cagr
-    const stocks = result.rows.map((r) => ({ tradingsymbol: r.tradingsymbol, exchange: r.exchange }));
-    ensureMissingStocksCagr(stocks).catch((err) =>
-      console.error("[Holdings] CAGR backfill error:", err.message)
-    );
-
     return success(res, { holdings: result.rows });
   } catch (err) {
     console.error("[Holdings] Get error:", err.message);
