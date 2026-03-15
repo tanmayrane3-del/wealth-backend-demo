@@ -7,9 +7,13 @@ const {
   addHolding,
   updateHolding,
   deleteHolding,
+  getMetalsSummary,
+  syncMetalsCagr,
 } = require("../controllers/metalsController");
 
 router.get("/rates",           validateSession, getRates);
+router.get("/summary",         validateSession, getMetalsSummary);
+router.post("/sync-cagr",      validateSession, syncMetalsCagr);
 router.get("/holdings",        validateSession, getHoldings);
 router.post("/holdings",       validateSession, addHolding);
 router.put("/holdings/:id",    validateSession, updateHolding);

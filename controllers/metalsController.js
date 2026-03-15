@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { success, fail } = require("../utils/respond");
 const { getLatestRates, fetchGoldDayChangePct } = require("../services/metalRateScraper");
+const { recomputeMetalsCagr } = require("../services/cagrCalculator");
 
 const VALID_METAL_TYPES = ["physical_gold", "digital_gold", "sgb"];
 const VALID_SUB_TYPES   = ["jewellery", "coins", "bars"];
@@ -213,4 +214,100 @@ const deleteHolding = async (req, res) => {
   }
 };
 
-module.exports = { getRates, getHoldings, addHolding, updateHolding, deleteHolding };
+// ─── GET /api/metals/summary ───────────────────────────────────────────────
+const getMetalsSummary = async (req, res) => {
+  try {
+    const [rates, dayChangePct, holdingsResult, cagrResult] = await Promise.all([
+      getLatestRates(),
+      fetchGoldDayChangePct().catch(() => 0),
+      pool.query(
+        `SELECT metal_type, quantity_grams, purity FROM metal_holdings WHERE user_id = $1`,
+        [req.user_id]
+      ),
+      pool.query(
+        `SELECT symbol,
+                multiplier_1y::float8, multiplier_3y::float8, multiplier_5y::float8
+         FROM asset_cagr
+         WHERE asset_type = 'metal'`
+      ),
+    ]);
+
+    const { gold_22k_per_gram, gold_24k_per_gram } = rates;
+
+    // Build a map of metal_type → CAGR multipliers
+    const cagrMap = {};
+    for (const row of cagrResult.rows) {
+      cagrMap[row.symbol] = {
+        multiplier_1y: row.multiplier_1y,
+        multiplier_3y: row.multiplier_3y,
+        multiplier_5y: row.multiplier_5y,
+      };
+    }
+
+    let total_value = 0;
+    let total_day_pnl = 0;
+    let projected_1y = 0;
+    let projected_3y = 0;
+    let projected_5y = 0;
+
+    for (const h of holdingsResult.rows) {
+      const qty  = parseFloat(h.quantity_grams);
+      const rate = h.metal_type === "physical_gold" && h.purity === "22k"
+        ? gold_22k_per_gram
+        : gold_24k_per_gram;
+      const current_value = qty * rate;
+      const day_change    = current_value - current_value / (1 + dayChangePct);
+
+      total_value    += current_value;
+      total_day_pnl  += day_change;
+
+      const cagr = cagrMap[h.metal_type];
+      projected_1y += current_value * (cagr?.multiplier_1y ?? 1.0);
+      projected_3y += current_value * (cagr?.multiplier_3y ?? 1.0);
+      projected_5y += current_value * (cagr?.multiplier_5y ?? 1.0);
+    }
+
+    const has_cagr = holdingsResult.rows.some((h) => !!cagrMap[h.metal_type]);
+
+    return success(res, {
+      total_value:    parseFloat(total_value.toFixed(2)),
+      total_day_pnl:  parseFloat(total_day_pnl.toFixed(2)),
+      projected_1y:   parseFloat(projected_1y.toFixed(2)),
+      projected_3y:   parseFloat(projected_3y.toFixed(2)),
+      projected_5y:   parseFloat(projected_5y.toFixed(2)),
+      has_cagr,
+    });
+  } catch (err) {
+    console.error("[metals/summary GET] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ─── POST /api/metals/sync-cagr ────────────────────────────────────────────
+const syncMetalsCagr = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT metal_type FROM metal_holdings WHERE user_id = $1`,
+      [req.user_id]
+    );
+
+    const metalTypes = result.rows.map((r) => r.metal_type);
+
+    if (metalTypes.length === 0) {
+      return success(res, { message: "No metal holdings found", updated: 0 });
+    }
+
+    await recomputeMetalsCagr(metalTypes);
+
+    return success(res, {
+      message: "CAGR computed successfully",
+      updated: metalTypes.length,
+      metal_types: metalTypes,
+    });
+  } catch (err) {
+    console.error("[metals/sync-cagr] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+module.exports = { getRates, getHoldings, addHolding, updateHolding, deleteHolding, getMetalsSummary, syncMetalsCagr };

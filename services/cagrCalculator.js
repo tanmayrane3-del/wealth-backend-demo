@@ -694,4 +694,26 @@ async function recomputeStocksCagr(stocks) {
   console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} stock(s)`);
 }
 
-module.exports = { initCagrScheduler, runCagrJob, recomputeStocksCagr };
+// ---------------------------------------------------------------------------
+// On-demand CAGR recompute for metals (called from sync-cagr endpoint)
+// ---------------------------------------------------------------------------
+
+/**
+ * Recomputes and upserts CAGR for all provided metal types.
+ * Always overwrites existing rows — no "missing only" logic.
+ * @param {string[]} metalTypes  e.g. ["physical_gold", "digital_gold"]
+ */
+async function recomputeMetalsCagr(metalTypes) {
+  if (!metalTypes || metalTypes.length === 0) return;
+
+  console.log(
+    `[CAGR/Sync] Recomputing CAGR for metals: ${metalTypes.join(", ")}`
+  );
+
+  const rows = await processMetals(metalTypes);
+  if (rows.length > 0) await upsertCagrRows(rows);
+
+  console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} metal type(s)`);
+}
+
+module.exports = { initCagrScheduler, runCagrJob, recomputeStocksCagr, recomputeMetalsCagr };
