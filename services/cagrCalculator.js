@@ -12,8 +12,6 @@ const yf = new YahooFinance({ suppressNotices: ["yahooSurvey", "ripHistorical"] 
 
 const RATE_LIMIT_MS = 600; // ms between Yahoo Finance calls
 
-const FLOOR_CAGR = 0.05; // 5% minimum projected return
-
 const CAPS = {
   LARGE_CAP: 0.25, // 25% ceiling for large-cap stocks
   MID_CAP:   0.35, // 35% ceiling for mid-cap stocks
@@ -73,11 +71,11 @@ function blendWithBenchmark(cagr, availableYears, targetYears, benchmark) {
 }
 
 /**
- * Clamp to [FLOOR_CAGR, cap].
+ * Clamp to [-1, cap]. Returns null if CAGR cannot be computed.
  */
 function applyFloorAndCap(cagr, cap) {
-  if (cagr == null || isNaN(cagr)) return FLOOR_CAGR;
-  return clamp(cagr, FLOOR_CAGR, cap);
+  if (cagr == null || isNaN(cagr)) return null;
+  return clamp(cagr, -1, cap);
 }
 
 /**
