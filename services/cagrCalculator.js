@@ -671,42 +671,27 @@ function initCagrScheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// On-demand backfill for missing stocks (called after holdings sync)
+// On-demand CAGR recompute (called after manual holdings sync)
 // ---------------------------------------------------------------------------
 
 /**
- * Checks which of the provided stocks are absent from asset_cagr and
- * computes CAGR only for those. Safe to fire-and-forget — errors are caught.
+ * Recomputes and upserts CAGR for all provided stocks.
+ * Always overwrites existing rows — no "missing only" logic.
+ * Safe to fire-and-forget.
  * @param {Array<{tradingsymbol: string, exchange: string}>} stocks
  */
-async function ensureMissingStocksCagr(stocks) {
+async function recomputeStocksCagr(stocks) {
   if (!stocks || stocks.length === 0) return;
 
-  const symbols = stocks.map((s) => s.tradingsymbol);
-
-  const existing = await pool.query(
-    // Exclude rows still carrying the old 5% floor value — treat them as missing so they get recomputed
-    `SELECT symbol FROM asset_cagr
-     WHERE symbol = ANY($1) AND asset_type = 'stock' AND cagr_1y != 0.05`,
-    [symbols]
-  );
-  const existingSet = new Set(existing.rows.map((r) => r.symbol));
-
-  const missing = stocks.filter((s) => !existingSet.has(s.tradingsymbol));
-  if (missing.length === 0) {
-    console.log("[CAGR/Backfill] All synced stocks already have CAGR data");
-    return;
-  }
-
   console.log(
-    `[CAGR/Backfill] Computing CAGR for ${missing.length} new stock(s): ` +
-    missing.map((s) => s.tradingsymbol).join(", ")
+    `[CAGR/Sync] Recomputing CAGR for ${stocks.length} stock(s): ` +
+    stocks.map((s) => s.tradingsymbol).join(", ")
   );
 
-  const rows = await processStocks(missing);
+  const rows = await processStocks(stocks);
   if (rows.length > 0) await upsertCagrRows(rows);
 
-  console.log(`[CAGR/Backfill] Done — inserted CAGR for ${rows.length} stock(s)`);
+  console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} stock(s)`);
 }
 
-module.exports = { initCagrScheduler, runCagrJob, ensureMissingStocksCagr };
+module.exports = { initCagrScheduler, runCagrJob, recomputeStocksCagr };
