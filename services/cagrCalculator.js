@@ -17,8 +17,8 @@ const CAPS = {
   MID_CAP:   0.35, // 35% ceiling for mid-cap stocks
   SMALL_CAP: 0.50, // 50% ceiling for small-cap stocks
   mf:        0.30, // 30% ceiling for mutual funds
-  metal:     0.20, // 20% ceiling for physical/digital gold
-  sgb:       0.225, // 22.5% ceiling for SGBs (gold CAGR + 2.5% interest)
+  metal:     1.00, // no meaningful cap — gold CAGR is factual price history
+  sgb:       1.025, // gold CAGR + 2.5% SGB interest, no cap
 };
 
 const BENCHMARKS = {
