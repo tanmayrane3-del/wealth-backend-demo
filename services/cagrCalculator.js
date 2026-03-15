@@ -146,12 +146,85 @@ function classifyMarketCap(marketCapUsd) {
 
 async function processStocks(stocks) {
   const rows = [];
-  const today      = new Date();
-  const fiveYrsAgo = new Date(today); fiveYrsAgo.setFullYear(today.getFullYear() - 5);
-  const oneYrAgo   = new Date(today); oneYrAgo.setFullYear(today.getFullYear() - 1);
+  const today       = new Date();
+  const fiveYrsAgo  = new Date(today); fiveYrsAgo.setFullYear(today.getFullYear() - 5);
+  const oneYrAgo    = new Date(today); oneYrAgo.setFullYear(today.getFullYear() - 1);
   const threeYrsAgo = new Date(today); threeYrsAgo.setFullYear(today.getFullYear() - 3);
 
-  for (const { tradingsymbol, exchange } of stocks) {
+  // SGBs (exchange 'GB') can't be looked up on Yahoo Finance — use GOLDBEES.NS + 2.5% SGB bonus
+  const isSgbStock  = (s) => s.exchange === "GB" || s.tradingsymbol.toUpperCase().startsWith("SGB");
+  const sgbStocks     = stocks.filter(isSgbStock);
+  const regularStocks = stocks.filter((s) => !isSgbStock(s));
+
+  // --- SGB stocks ---
+  if (sgbStocks.length > 0) {
+    let goldHistory = null;
+    try {
+      const hist = await yf.historical("GOLDBEES.NS", {
+        period1: fiveYrsAgo, period2: today, interval: "1mo",
+      }, { validateResult: false });
+      goldHistory = [...hist].sort((a, b) => new Date(a.date) - new Date(b.date));
+      console.log(`[CAGR/Stock-SGB] GOLDBEES.NS — ${goldHistory.length} monthly rows`);
+      await sleep(RATE_LIMIT_MS);
+    } catch (err) {
+      console.error(`[CAGR/Stock-SGB] Failed to fetch GOLDBEES.NS: ${err.message}`);
+    }
+
+    for (const { tradingsymbol, exchange } of sgbStocks) {
+      if (!goldHistory) {
+        console.warn(`[CAGR/Stock-SGB] Skipped ${tradingsymbol}: GOLDBEES.NS unavailable`);
+        continue;
+      }
+      const availYrs   = availableYears(goldHistory);
+      const latestP    = goldHistory.at(-1)?.close ?? goldHistory.at(-1)?.adjclose;
+      const SGB_BONUS  = 0.025;
+
+      let cagr1y, cagr3y, cagr5y;
+
+      cagr1y = availYrs >= 1
+        ? (computeCagr(findClosestPrice(goldHistory, oneYrAgo), latestP, 1) ?? BENCHMARKS.metal) + SGB_BONUS
+        : BENCHMARKS.metal + SGB_BONUS;
+
+      if (availYrs >= 3) {
+        cagr3y = (computeCagr(findClosestPrice(goldHistory, threeYrsAgo), latestP, 3) ?? BENCHMARKS.metal) + SGB_BONUS;
+      } else if (availYrs >= 1) {
+        const raw = (computeCagr(findClosestPrice(goldHistory, oneYrAgo), latestP, Math.max(availYrs, 1)) ?? BENCHMARKS.metal) + SGB_BONUS;
+        cagr3y = blendWithBenchmark(raw - SGB_BONUS, availYrs, 3, BENCHMARKS.metal) + SGB_BONUS;
+      } else {
+        cagr3y = BENCHMARKS.metal + SGB_BONUS;
+      }
+
+      if (availYrs >= 5) {
+        cagr5y = (computeCagr(findClosestPrice(goldHistory, fiveYrsAgo), latestP, 5) ?? BENCHMARKS.metal) + SGB_BONUS;
+      } else if (availYrs >= 1) {
+        const raw = (computeCagr(findClosestPrice(goldHistory, fiveYrsAgo), latestP, Math.max(availYrs, 1)) ?? BENCHMARKS.metal) + SGB_BONUS;
+        cagr5y = blendWithBenchmark(raw - SGB_BONUS, availYrs, 5, BENCHMARKS.metal) + SGB_BONUS;
+      } else {
+        cagr5y = BENCHMARKS.metal + SGB_BONUS;
+      }
+
+      cagr1y = applyFloorAndCap(cagr1y, CAPS.sgb);
+      cagr3y = applyFloorAndCap(cagr3y, CAPS.sgb);
+      cagr5y = applyFloorAndCap(cagr5y, CAPS.sgb);
+
+      const mults = computeMultipliers(cagr1y, cagr3y, cagr5y);
+      rows.push({
+        symbol: tradingsymbol, asset_type: "stock", exchange, isin: null,
+        scheme_code: null, category: "sgb",
+        cagr_1y: parseFloat(cagr1y.toFixed(4)),
+        cagr_3y: parseFloat(cagr3y.toFixed(4)),
+        cagr_5y: parseFloat(cagr5y.toFixed(4)),
+        ...mults, cagr_source: "yahoo-finance2/GOLDBEES.NS+2.5%",
+      });
+      console.log(
+        `[CAGR/Stock-SGB] ${tradingsymbol} (+2.5%) | ` +
+        `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
+      );
+    }
+  }
+
+  // --- Regular stocks ---
+  for (const { tradingsymbol, exchange } of regularStocks) {
     const ticker = `${tradingsymbol}.NS`;
 
     try {
@@ -612,7 +685,9 @@ async function ensureMissingStocksCagr(stocks) {
   const symbols = stocks.map((s) => s.tradingsymbol);
 
   const existing = await pool.query(
-    `SELECT symbol FROM asset_cagr WHERE symbol = ANY($1) AND asset_type = 'stock'`,
+    // Exclude rows still carrying the old 5% floor value — treat them as missing so they get recomputed
+    `SELECT symbol FROM asset_cagr
+     WHERE symbol = ANY($1) AND asset_type = 'stock' AND cagr_1y != 0.05`,
     [symbols]
   );
   const existingSet = new Set(existing.rows.map((r) => r.symbol));
