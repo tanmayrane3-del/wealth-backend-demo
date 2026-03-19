@@ -6,7 +6,9 @@ const pool    = require("../db");
 // Config & Constants
 // ---------------------------------------------------------------------------
 
-const RATE_LIMIT_MS = 300; // ms between Stooq calls (much less restrictive than Yahoo)
+// Alpha Vantage free tier: 5 requests/minute → 1 per 12 s to stay within limit
+const RATE_LIMIT_MS = 12_000;
+const AV_KEY = process.env.ALPHA_VANTAGE_KEY; // set in Render environment variables
 
 // SEBI large-cap: top 100 stocks by market cap (Nifty 50 + Nifty Next 50)
 const NIFTY100_SYMBOLS = new Set([
@@ -115,36 +117,43 @@ function findClosestPrice(history, targetDate) {
 }
 
 /**
- * Fetch monthly price history from Stooq (no API key, no crumb).
- * Ticker examples: "HDFCBANK.NS", "GOLDBEES.NS"
+ * Fetch monthly adjusted-close history from Alpha Vantage.
+ * Accepts ".NS" tickers (NSE convention) and converts to ".NSE" for Alpha Vantage.
  * Returns array of { date: Date, close: number } sorted oldest→newest.
+ * Requires ALPHA_VANTAGE_KEY env var.
  */
-async function fetchStooqHistory(ticker, fromDate) {
-  const d1 = fromDate.toISOString().slice(0, 10).replace(/-/g, "");
-  const d2 = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(ticker.toLowerCase())}&d1=${d1}&d2=${d2}&i=m`;
+async function fetchAlphaVantageHistory(ticker, fromDate) {
+  if (!AV_KEY) throw new Error("ALPHA_VANTAGE_KEY env var not set");
 
-  const resp = await axios.get(url, {
-    timeout: 15_000,
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; WealthManager/1.0)" },
-    responseType: "text",
-  });
+  // Convert .NS → .NSE (Alpha Vantage convention for NSE-listed instruments)
+  const avSymbol = ticker.toUpperCase().endsWith(".NS")
+    ? ticker.slice(0, -3) + ".NSE"
+    : ticker.toUpperCase();
 
-  const text = resp.data || "";
-  if (!text.startsWith("Date")) throw new Error(`Stooq returned non-CSV for ${ticker}`);
+  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${encodeURIComponent(avSymbol)}&apikey=${AV_KEY}&outputsize=full`;
+
+  const resp = await axios.get(url, { timeout: 20_000 });
+  const data = resp.data;
+
+  if (data["Information"]) throw new Error(`AV rate limit hit: ${data["Information"]}`);
+  if (data["Error Message"]) throw new Error(`AV error: ${data["Error Message"]}`);
+  if (data["Note"]) throw new Error(`AV note (rate limit): ${data["Note"]}`);
+
+  const series = data["Monthly Adjusted Time Series"];
+  if (!series || Object.keys(series).length === 0) {
+    throw new Error(`No data returned for ${avSymbol}`);
+  }
 
   const rows = [];
-  const lines = text.trim().split("\n").slice(1); // skip header
-  for (const line of lines) {
-    const parts = line.split(",");
-    if (parts.length < 5) continue;
-    const close = parseFloat(parts[4]);
-    if (!isNaN(close) && close > 0) {
-      rows.push({ date: new Date(parts[0]), close });
-    }
+  for (const [dateStr, values] of Object.entries(series)) {
+    const date = new Date(dateStr);
+    if (date < fromDate) continue; // skip older than our 5-yr window
+    const close = parseFloat(values["5. adjusted close"]);
+    if (!isNaN(close) && close > 0) rows.push({ date, close });
   }
-  // Stooq returns newest-first → sort oldest-first
-  rows.sort((a, b) => a.date - b.date);
+
+  rows.sort((a, b) => a.date - b.date); // oldest→newest
+  if (rows.length < 2) throw new Error(`Insufficient history for ${avSymbol}`);
   return rows;
 }
 
@@ -207,7 +216,7 @@ async function processStocks(stocks) {
   if (sgbStocks.length > 0) {
     let goldHistory = null;
     try {
-      goldHistory = await fetchStooqHistory("GOLDBEES.NS", fiveYrsAgo);
+      goldHistory = await fetchAlphaVantageHistory("GOLDBEES.NS", fiveYrsAgo);
       console.log(`[CAGR/Stock-SGB] GOLDBEES.NS — ${goldHistory.length} monthly rows`);
       await sleep(RATE_LIMIT_MS);
     } catch (err) {
@@ -258,7 +267,7 @@ async function processStocks(stocks) {
         cagr_1y: parseFloat(cagr1y.toFixed(4)),
         cagr_3y: parseFloat(cagr3y.toFixed(4)),
         cagr_5y: parseFloat(cagr5y.toFixed(4)),
-        ...mults, cagr_source: "stooq.com/GOLDBEES.NS+2.5%",
+        ...mults, cagr_source: "alphavantage/GOLDBEES.NSE+2.5%",
       });
       console.log(
         `[CAGR/Stock-SGB] ${tradingsymbol} (+2.5%) | ` +
@@ -273,7 +282,7 @@ async function processStocks(stocks) {
 
     try {
       // Fetch 5-year monthly history from Stooq (no auth/crumb needed)
-      const sorted = await fetchStooqHistory(ticker, fiveYrsAgo);
+      const sorted = await fetchAlphaVantageHistory(ticker, fiveYrsAgo);
 
       // Classify by Nifty 100 membership instead of live market-cap lookup
       const { category, cap } = classifyBySymbol(tradingsymbol);
@@ -333,7 +342,7 @@ async function processStocks(stocks) {
         cagr_3y:      parseFloat(cagr3y.toFixed(4)),
         cagr_5y:      parseFloat(cagr5y.toFixed(4)),
         ...mults,
-        cagr_source:  "stooq.com",
+        cagr_source:  "alphavantage",
       });
 
       console.log(
@@ -515,7 +524,7 @@ async function processMetals(metalTypes) {
   let goldFetchErr = null;
   if (known.some((mt) => METAL_TICKERS[mt] === "GOLDBEES.NS")) {
     try {
-      goldHistory = await fetchStooqHistory("GOLDBEES.NS", fiveYrsAgo);
+      goldHistory = await fetchAlphaVantageHistory("GOLDBEES.NS", fiveYrsAgo);
       console.log(`[CAGR/Metal] GOLDBEES.NS history — ${goldHistory.length} monthly rows`);
       await sleep(RATE_LIMIT_MS);
     } catch (err) {
@@ -591,7 +600,7 @@ async function processMetals(metalTypes) {
       cagr_3y:     parseFloat(cagr3y.toFixed(4)),
       cagr_5y:     parseFloat(cagr5y.toFixed(4)),
       ...mults,
-      cagr_source: "stooq.com/GOLDBEES.NS",
+      cagr_source: "alphavantage/GOLDBEES.NSE",
     });
 
     console.log(
