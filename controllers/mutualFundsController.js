@@ -1,6 +1,6 @@
 const pool    = require("../db");
 const axios   = require("axios");
-const pdfParse = require("pdf-parse");
+// pdf-parse is lazy-loaded inside parseCasPdf to avoid startup crash on Render
 const { success, fail }     = require("../utils/respond");
 const { recomputeMfCagr }   = require("../services/cagrCalculator");
 
@@ -180,6 +180,7 @@ const parseCasPdf = async (req, res) => {
 
   let text;
   try {
+    const pdfParse = require("pdf-parse");
     const parsed = await pdfParse(req.file.buffer);
     text = parsed.text;
   } catch (err) {
