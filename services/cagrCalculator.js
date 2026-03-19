@@ -122,7 +122,7 @@ function availableYears(history) {
 async function collectUniqueSymbols() {
   const [stocksRes, mfsRes, metalsRes] = await Promise.all([
     pool.query("SELECT DISTINCT tradingsymbol, exchange FROM stock_holdings"),
-    pool.query("SELECT DISTINCT isin FROM mf_holdings WHERE isin IS NOT NULL AND isin <> ''"),
+    pool.query("SELECT DISTINCT isin FROM mutual_fund_holdings WHERE isin IS NOT NULL AND isin <> ''"),
     pool.query("SELECT DISTINCT metal_type FROM metal_holdings"),
   ]);
 
@@ -716,4 +716,26 @@ async function recomputeMetalsCagr(metalTypes) {
   console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} metal type(s)`);
 }
 
-module.exports = { initCagrScheduler, runCagrJob, recomputeStocksCagr, recomputeMetalsCagr };
+// ---------------------------------------------------------------------------
+// On-demand CAGR recompute for mutual funds (called from sync-cagr endpoint)
+// ---------------------------------------------------------------------------
+
+/**
+ * Recomputes and upserts CAGR for all provided ISINs.
+ * Always overwrites existing rows.
+ * @param {string[]} isins  e.g. ["INF109K01AN1", "INF204K01AT7"]
+ */
+async function recomputeMfCagr(isins) {
+  if (!isins || isins.length === 0) return;
+
+  console.log(
+    `[CAGR/Sync] Recomputing CAGR for ${isins.length} MF ISIN(s): ${isins.join(", ")}`
+  );
+
+  const rows = await processMFs(isins);
+  if (rows.length > 0) await upsertCagrRows(rows);
+
+  console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} MF(s)`);
+}
+
+module.exports = { initCagrScheduler, runCagrJob, recomputeStocksCagr, recomputeMetalsCagr, recomputeMfCagr };

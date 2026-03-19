@@ -27,8 +27,9 @@ const adminRoutes = require("./routes/admin");
 const zerodhaRoutes = require("./routes/zerodha");
 const holdingsRoutes = require("./routes/holdings");
 const kiteRoutes = require("./routes/kite");
-const metalsRoutes = require("./routes/metals");
-const cagrRoutes   = require("./routes/cagr");
+const metalsRoutes       = require("./routes/metals");
+const cagrRoutes         = require("./routes/cagr");
+const mutualFundsRoutes  = require("./routes/mutualFunds");
 
 // Use routes
 app.use("/api/users", userRoutes);
@@ -46,8 +47,9 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/zerodha", zerodhaRoutes);
 app.use("/api/holdings", holdingsRoutes);
 app.use("/api/kite", kiteRoutes);
-app.use("/api/metals", metalsRoutes);
-app.use("/api/cagr",   cagrRoutes);
+app.use("/api/metals",       metalsRoutes);
+app.use("/api/cagr",         cagrRoutes);
+app.use("/api/mutual-funds", mutualFundsRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
