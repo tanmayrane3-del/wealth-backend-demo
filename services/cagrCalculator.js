@@ -10,7 +10,7 @@ const yf = new YahooFinance({ suppressNotices: ["yahooSurvey", "ripHistorical"] 
 // Config & Constants
 // ---------------------------------------------------------------------------
 
-const RATE_LIMIT_MS = 600; // ms between Yahoo Finance calls
+const RATE_LIMIT_MS = 10_000; // 10 s between Yahoo Finance calls
 
 const CAPS = {
   LARGE_CAP: 0.25, // 25% ceiling for large-cap stocks
