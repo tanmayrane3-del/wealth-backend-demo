@@ -2,15 +2,29 @@ const cron    = require("node-cron");
 const axios   = require("axios");
 const pool    = require("../db");
 
-// yahoo-finance2 v3 requires instantiation via `new`.
-const YahooFinance = require("yahoo-finance2").default;
-const yf = new YahooFinance({ suppressNotices: ["yahooSurvey", "ripHistorical"] });
-
 // ---------------------------------------------------------------------------
 // Config & Constants
 // ---------------------------------------------------------------------------
 
-const RATE_LIMIT_MS = 600; // ms between Yahoo Finance calls
+const RATE_LIMIT_MS = 300; // ms between Stooq calls (much less restrictive than Yahoo)
+
+// SEBI large-cap: top 100 stocks by market cap (Nifty 50 + Nifty Next 50)
+const NIFTY100_SYMBOLS = new Set([
+  // Nifty 50
+  "ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE",
+  "BAJAJFINSV","BEL","BPCL","BHARTIARTL","BRITANNIA","CIPLA","COALINDIA",
+  "DRREDDY","EICHERMOT","GRASIM","HCLTECH","HDFCBANK","HDFCLIFE","HEROMOTOCO",
+  "HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","IOC","ITC",
+  "JSWSTEEL","KOTAKBANK","LT","M&M","MARUTI","NESTLEIND","NTPC","ONGC",
+  "POWERGRID","RELIANCE","SBILIFE","SBIN","SHRIRAMFIN","SUNPHARMA","TATACONSUM",
+  "TATAMOTORS","TATASTEEL","TCS","TECHM","TITAN","TRENT","ULTRACEMCO","WIPRO",
+  // Nifty Next 50
+  "ADANIENT","ADANIGREEN","AMBUJACEM","BANKBARODA","BHEL","BOSCHLTD","CANBK",
+  "CHOLAFIN","COLPAL","DABUR","DLF","GAIL","GODREJCP","HAVELLS","ICICIGI",
+  "ICICIPRULI","INDHOTEL","IRCTC","IRFC","LTIM","LUPIN","MOTHERSON","MUTHOOTFIN",
+  "NHPC","NAUKRI","OFSS","OIL","PIIND","PNB","RECLTD","SIEMENS","SRF",
+  "TORNTPHARM","TVSMOTOR","UNIONBANK","VEDL","VOLTAS","ZOMATO","ZYDUSLIFE",
+]);
 
 const CAPS = {
   LARGE_CAP: 0.25, // 25% ceiling for large-cap stocks
@@ -27,13 +41,8 @@ const BENCHMARKS = {
   metal: 0.08, // 8%  blended benchmark for metals
 };
 
-// SEBI market-cap thresholds in USD
-// Large cap: top ~100 companies  (~₹20,000 crore = ~$2.4B at ₹83/USD)
-// Mid cap:   101–250             (~₹5,000 crore  = ~$600M)
-const LARGE_CAP_USD = 2_400_000_000;
-const MID_CAP_USD   =   600_000_000;
 
-// metal_type (from metal_holdings table) → Yahoo Finance ETF ticker
+// metal_type (from metal_holdings table) → Stooq/NSE ETF ticker
 const METAL_TICKERS = {
   physical_gold: "GOLDBEES.NS",
   digital_gold:  "GOLDBEES.NS",
@@ -106,6 +115,51 @@ function findClosestPrice(history, targetDate) {
 }
 
 /**
+ * Fetch monthly price history from Stooq (no API key, no crumb).
+ * Ticker examples: "HDFCBANK.NS", "GOLDBEES.NS"
+ * Returns array of { date: Date, close: number } sorted oldest→newest.
+ */
+async function fetchStooqHistory(ticker, fromDate) {
+  const d1 = fromDate.toISOString().slice(0, 10).replace(/-/g, "");
+  const d2 = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(ticker.toLowerCase())}&d1=${d1}&d2=${d2}&i=m`;
+
+  const resp = await axios.get(url, {
+    timeout: 15_000,
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; WealthManager/1.0)" },
+    responseType: "text",
+  });
+
+  const text = resp.data || "";
+  if (!text.startsWith("Date")) throw new Error(`Stooq returned non-CSV for ${ticker}`);
+
+  const rows = [];
+  const lines = text.trim().split("\n").slice(1); // skip header
+  for (const line of lines) {
+    const parts = line.split(",");
+    if (parts.length < 5) continue;
+    const close = parseFloat(parts[4]);
+    if (!isNaN(close) && close > 0) {
+      rows.push({ date: new Date(parts[0]), close });
+    }
+  }
+  // Stooq returns newest-first → sort oldest-first
+  rows.sort((a, b) => a.date - b.date);
+  return rows;
+}
+
+/**
+ * Classify stock by symbol against Nifty 100 (no live API call needed).
+ * Large cap = Nifty 100 member, otherwise mid-cap.
+ */
+function classifyBySymbol(tradingsymbol) {
+  if (NIFTY100_SYMBOLS.has(tradingsymbol.toUpperCase())) {
+    return { category: "LARGE_CAP", cap: CAPS.LARGE_CAP };
+  }
+  return { category: "MID_CAP", cap: CAPS.MID_CAP };
+}
+
+/**
  * Compute how many years of history are available in a monthly series.
  */
 function availableYears(history) {
@@ -137,13 +191,6 @@ async function collectUniqueSymbols() {
 // Stock CAGR
 // ---------------------------------------------------------------------------
 
-function classifyMarketCap(marketCapUsd) {
-  if (!marketCapUsd) return { category: "SMALL_CAP", cap: CAPS.SMALL_CAP };
-  if (marketCapUsd >= LARGE_CAP_USD) return { category: "LARGE_CAP", cap: CAPS.LARGE_CAP };
-  if (marketCapUsd >= MID_CAP_USD)   return { category: "MID_CAP",   cap: CAPS.MID_CAP   };
-  return { category: "SMALL_CAP", cap: CAPS.SMALL_CAP };
-}
-
 async function processStocks(stocks) {
   const rows = [];
   const today       = new Date();
@@ -151,7 +198,7 @@ async function processStocks(stocks) {
   const oneYrAgo    = new Date(today); oneYrAgo.setFullYear(today.getFullYear() - 1);
   const threeYrsAgo = new Date(today); threeYrsAgo.setFullYear(today.getFullYear() - 3);
 
-  // SGBs (exchange 'GB') can't be looked up on Yahoo Finance — use GOLDBEES.NS + 2.5% SGB bonus
+  // SGBs (exchange 'GB') don't trade on NSE — proxy via GOLDBEES.NS + 2.5% SGB interest bonus
   const isSgbStock  = (s) => s.exchange === "GB" || s.tradingsymbol.toUpperCase().startsWith("SGB");
   const sgbStocks     = stocks.filter(isSgbStock);
   const regularStocks = stocks.filter((s) => !isSgbStock(s));
@@ -160,10 +207,7 @@ async function processStocks(stocks) {
   if (sgbStocks.length > 0) {
     let goldHistory = null;
     try {
-      const hist = await yf.historical("GOLDBEES.NS", {
-        period1: fiveYrsAgo, period2: today, interval: "1mo",
-      }, { validateResult: false });
-      goldHistory = [...hist].sort((a, b) => new Date(a.date) - new Date(b.date));
+      goldHistory = await fetchStooqHistory("GOLDBEES.NS", fiveYrsAgo);
       console.log(`[CAGR/Stock-SGB] GOLDBEES.NS — ${goldHistory.length} monthly rows`);
       await sleep(RATE_LIMIT_MS);
     } catch (err) {
@@ -214,7 +258,7 @@ async function processStocks(stocks) {
         cagr_1y: parseFloat(cagr1y.toFixed(4)),
         cagr_3y: parseFloat(cagr3y.toFixed(4)),
         cagr_5y: parseFloat(cagr5y.toFixed(4)),
-        ...mults, cagr_source: "yahoo-finance2/GOLDBEES.NS+2.5%",
+        ...mults, cagr_source: "stooq.com/GOLDBEES.NS+2.5%",
       });
       console.log(
         `[CAGR/Stock-SGB] ${tradingsymbol} (+2.5%) | ` +
@@ -228,16 +272,11 @@ async function processStocks(stocks) {
     const ticker = `${tradingsymbol}.NS`;
 
     try {
-      // Fetch quote (for market cap) and 5-year monthly history in parallel
-      const [quote, history] = await Promise.all([
-        yf.quote(ticker, {}, { validateResult: false }),
-        yf.historical(ticker, { period1: fiveYrsAgo, period2: today, interval: "1mo" }),
-      ]);
+      // Fetch 5-year monthly history from Stooq (no auth/crumb needed)
+      const sorted = await fetchStooqHistory(ticker, fiveYrsAgo);
 
-      // Sort oldest→newest
-      const sorted = [...history].sort((a, b) => new Date(a.date) - new Date(b.date));
-
-      const { category, cap } = classifyMarketCap(quote?.marketCap);
+      // Classify by Nifty 100 membership instead of live market-cap lookup
+      const { category, cap } = classifyBySymbol(tradingsymbol);
       const availYears = availableYears(sorted);
       const latestPrice = sorted.at(-1)?.close ?? sorted.at(-1)?.adjclose;
 
@@ -294,7 +333,7 @@ async function processStocks(stocks) {
         cagr_3y:      parseFloat(cagr3y.toFixed(4)),
         cagr_5y:      parseFloat(cagr5y.toFixed(4)),
         ...mults,
-        cagr_source:  "yahoo-finance2",
+        cagr_source:  "stooq.com",
       });
 
       console.log(
@@ -476,12 +515,7 @@ async function processMetals(metalTypes) {
   let goldFetchErr = null;
   if (known.some((mt) => METAL_TICKERS[mt] === "GOLDBEES.NS")) {
     try {
-      const hist = await yf.historical("GOLDBEES.NS", {
-        period1:  fiveYrsAgo,
-        period2:  today,
-        interval: "1mo",
-      }, { validateResult: false });
-      goldHistory = [...hist].sort((a, b) => new Date(a.date) - new Date(b.date));
+      goldHistory = await fetchStooqHistory("GOLDBEES.NS", fiveYrsAgo);
       console.log(`[CAGR/Metal] GOLDBEES.NS history — ${goldHistory.length} monthly rows`);
       await sleep(RATE_LIMIT_MS);
     } catch (err) {
@@ -557,7 +591,7 @@ async function processMetals(metalTypes) {
       cagr_3y:     parseFloat(cagr3y.toFixed(4)),
       cagr_5y:     parseFloat(cagr5y.toFixed(4)),
       ...mults,
-      cagr_source: "yahoo-finance2/GOLDBEES.NS",
+      cagr_source: "stooq.com/GOLDBEES.NS",
     });
 
     console.log(
