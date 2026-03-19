@@ -6,9 +6,7 @@ const pool    = require("../db");
 // Config & Constants
 // ---------------------------------------------------------------------------
 
-// Alpha Vantage free tier: 5 requests/minute → 1 per 12 s to stay within limit
-const RATE_LIMIT_MS = 12_000;
-const AV_KEY = process.env.ALPHA_VANTAGE_KEY; // set in Render environment variables
+const RATE_LIMIT_MS = 2_000; // 2 s between Yahoo Finance chart API calls
 
 // SEBI large-cap: top 100 stocks by market cap (Nifty 50 + Nifty Next 50)
 const NIFTY100_SYMBOLS = new Set([
@@ -116,44 +114,70 @@ function findClosestPrice(history, targetDate) {
   return best?.close ?? best?.adjclose ?? null;
 }
 
+// Cached Yahoo Finance session cookie (refreshed every 30 min)
+let _yahooCookie = null;
+let _yahooCookieExpiry = 0;
+
+async function getYahooCookie() {
+  if (_yahooCookie && Date.now() < _yahooCookieExpiry) return _yahooCookie;
+
+  const resp = await axios.get("https://finance.yahoo.com", {
+    timeout: 15_000,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+    },
+    maxRedirects: 5,
+  });
+
+  const raw = resp.headers["set-cookie"] || [];
+  _yahooCookie = raw.map(c => c.split(";")[0]).join("; ");
+  _yahooCookieExpiry = Date.now() + 30 * 60 * 1000; // cache 30 min
+  return _yahooCookie;
+}
+
 /**
- * Fetch monthly adjusted-close history from Alpha Vantage.
- * Accepts ".NS" tickers (NSE convention) and converts to ".NSE" for Alpha Vantage.
+ * Fetch monthly price history from Yahoo Finance v8/finance/chart.
+ * Uses cookie-only auth (no crumb needed) — bypasses the crumb 429 block.
  * Returns array of { date: Date, close: number } sorted oldest→newest.
- * Requires ALPHA_VANTAGE_KEY env var.
  */
-async function fetchAlphaVantageHistory(ticker, fromDate) {
-  if (!AV_KEY) throw new Error("ALPHA_VANTAGE_KEY env var not set");
+async function fetchYahooChartHistory(ticker, fromDate) {
+  const cookie = await getYahooCookie();
+  const period1 = Math.floor(fromDate.getTime() / 1000);
+  const period2 = Math.floor(Date.now() / 1000);
 
-  // Convert .NS → .NSE (Alpha Vantage convention for NSE-listed instruments)
-  const avSymbol = ticker.toUpperCase().endsWith(".NS")
-    ? ticker.slice(0, -3) + ".NSE"
-    : ticker.toUpperCase();
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`
+    + `?period1=${period1}&period2=${period2}&interval=1mo&includePrePost=false`;
 
-  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${encodeURIComponent(avSymbol)}&apikey=${AV_KEY}&outputsize=full`;
+  const resp = await axios.get(url, {
+    timeout: 15_000,
+    headers: {
+      "Cookie": cookie,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Referer": "https://finance.yahoo.com/",
+      "Accept": "application/json",
+    },
+  });
 
-  const resp = await axios.get(url, { timeout: 20_000 });
-  const data = resp.data;
+  const result = resp.data?.chart?.result?.[0];
+  if (!result) throw new Error(`No chart data for ${ticker}`);
 
-  if (data["Information"]) throw new Error(`AV rate limit hit: ${data["Information"]}`);
-  if (data["Error Message"]) throw new Error(`AV error: ${data["Error Message"]}`);
-  if (data["Note"]) throw new Error(`AV note (rate limit): ${data["Note"]}`);
+  const timestamps = result.timestamp;
+  const closes = result.indicators?.adjclose?.[0]?.adjclose
+               ?? result.indicators?.quote?.[0]?.close;
 
-  const series = data["Monthly Adjusted Time Series"];
-  if (!series || Object.keys(series).length === 0) {
-    throw new Error(`No data returned for ${avSymbol}`);
-  }
+  if (!timestamps || !closes) throw new Error(`Missing price data for ${ticker}`);
 
   const rows = [];
-  for (const [dateStr, values] of Object.entries(series)) {
-    const date = new Date(dateStr);
-    if (date < fromDate) continue; // skip older than our 5-yr window
-    const close = parseFloat(values["5. adjusted close"]);
-    if (!isNaN(close) && close > 0) rows.push({ date, close });
+  for (let i = 0; i < timestamps.length; i++) {
+    const close = closes[i];
+    if (close != null && close > 0) {
+      rows.push({ date: new Date(timestamps[i] * 1000), close });
+    }
   }
-
-  rows.sort((a, b) => a.date - b.date); // oldest→newest
-  if (rows.length < 2) throw new Error(`Insufficient history for ${avSymbol}`);
+  rows.sort((a, b) => a.date - b.date);
+  if (rows.length < 2) throw new Error(`Insufficient history for ${ticker}`);
   return rows;
 }
 
@@ -216,7 +240,7 @@ async function processStocks(stocks) {
   if (sgbStocks.length > 0) {
     let goldHistory = null;
     try {
-      goldHistory = await fetchAlphaVantageHistory("GOLDBEES.NS", fiveYrsAgo);
+      goldHistory = await fetchYahooChartHistory("GOLDBEES.NS", fiveYrsAgo);
       console.log(`[CAGR/Stock-SGB] GOLDBEES.NS — ${goldHistory.length} monthly rows`);
       await sleep(RATE_LIMIT_MS);
     } catch (err) {
@@ -267,7 +291,7 @@ async function processStocks(stocks) {
         cagr_1y: parseFloat(cagr1y.toFixed(4)),
         cagr_3y: parseFloat(cagr3y.toFixed(4)),
         cagr_5y: parseFloat(cagr5y.toFixed(4)),
-        ...mults, cagr_source: "alphavantage/GOLDBEES.NSE+2.5%",
+        ...mults, cagr_source: "yahoo-finance/v8/GOLDBEES.NS+2.5%",
       });
       console.log(
         `[CAGR/Stock-SGB] ${tradingsymbol} (+2.5%) | ` +
@@ -282,7 +306,7 @@ async function processStocks(stocks) {
 
     try {
       // Fetch 5-year monthly history from Stooq (no auth/crumb needed)
-      const sorted = await fetchAlphaVantageHistory(ticker, fiveYrsAgo);
+      const sorted = await fetchYahooChartHistory(ticker, fiveYrsAgo);
 
       // Classify by Nifty 100 membership instead of live market-cap lookup
       const { category, cap } = classifyBySymbol(tradingsymbol);
@@ -342,7 +366,7 @@ async function processStocks(stocks) {
         cagr_3y:      parseFloat(cagr3y.toFixed(4)),
         cagr_5y:      parseFloat(cagr5y.toFixed(4)),
         ...mults,
-        cagr_source:  "alphavantage",
+        cagr_source:  "yahoo-finance/v8",
       });
 
       console.log(
@@ -524,7 +548,7 @@ async function processMetals(metalTypes) {
   let goldFetchErr = null;
   if (known.some((mt) => METAL_TICKERS[mt] === "GOLDBEES.NS")) {
     try {
-      goldHistory = await fetchAlphaVantageHistory("GOLDBEES.NS", fiveYrsAgo);
+      goldHistory = await fetchYahooChartHistory("GOLDBEES.NS", fiveYrsAgo);
       console.log(`[CAGR/Metal] GOLDBEES.NS history — ${goldHistory.length} monthly rows`);
       await sleep(RATE_LIMIT_MS);
     } catch (err) {
@@ -600,7 +624,7 @@ async function processMetals(metalTypes) {
       cagr_3y:     parseFloat(cagr3y.toFixed(4)),
       cagr_5y:     parseFloat(cagr5y.toFixed(4)),
       ...mults,
-      cagr_source: "alphavantage/GOLDBEES.NSE",
+      cagr_source: "yahoo-finance/v8/GOLDBEES.NS",
     });
 
     console.log(
