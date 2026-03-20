@@ -203,105 +203,111 @@ const parseCasPdf = async (req, res) => {
 };
 
 async function extractFundsFromCas(text) {
-  // Split on "Folio No :" boundary — block[0] is the header preamble
-  const blocks = text.split(/Folio No\s*:/i);
+  // KFINTECH CAS PDFs extract in a non-obvious order:
+  // - Each ISIN line appears one line BEFORE its "Folio No :" marker
+  // - Transactions are multi-line: date alone, type, amount, then units+nav concatenated
+  // - Page-2 content can interleave transactions from different funds
+  // Strategy: find all ISINs in order, find all closing balances in order,
+  // match by position, then assign transactions by line range.
 
-  const funds = [];
+  const lines = text.split("\n").map((l) => l.trim());
 
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i];
-
-    // --- Folio number: first non-empty token(s) up to newline
-    const folioLine = block.split("\n")[0].trim();
-    const folioNumber = folioLine.split(/\s+/).slice(0, 2).join("").trim() || "UNKNOWN";
-
-    // --- ISIN
-    const isinMatch = block.match(/ISIN[:\s]+([A-Z]{2}[A-Z0-9]{10})/);
+  // --- Step 1: Fund declarations (ISIN, scheme, folio, AMC)
+  const fundDecls = [];
+  for (let i = 0; i < lines.length; i++) {
+    const isinMatch = lines[i].match(/ISIN[:\s]+([A-Z]{2}[A-Z0-9]{10})/);
     if (!isinMatch) continue;
     const isin = isinMatch[1];
 
-    // --- AMC name: from the last non-empty line in the PREVIOUS preamble block
+    // Scheme name = everything before " - ISIN" on this line
+    const schemeName = lines[i].split(/\s*-\s*ISIN/i)[0].trim() || isin;
+
+    // Folio number: on same or next line
+    const folioSrc = lines[i] + " " + (lines[i + 1] || "");
+    const fm = folioSrc.match(/Folio No\s*:\s*(\S+)/i);
+    const folioNumber = fm ? fm[1] : "UNKNOWN";
+
+    // AMC: scan backwards, skip Nominee / portfolio header lines
     let amcName = null;
-    if (i === 1) {
-      // First fund — AMC is in the header preamble (block[0])
-      const prevLines = blocks[0].split("\n").map((l) => l.trim()).filter(Boolean);
-      amcName = prevLines[prevLines.length - 1] ?? null;
-    } else {
-      // AMC is the last non-empty line before "Folio No" in the previous block
-      const prevBlock = blocks[i - 1];
-      const prevLines = prevBlock.split("\n").map((l) => l.trim()).filter(Boolean);
-      amcName = prevLines[prevLines.length - 1] ?? null;
-    }
-    // Sanitize: skip if it looks like a transaction line
-    if (amcName && /^\d{2}-[A-Z]{3}-\d{4}/.test(amcName)) amcName = null;
-
-    // --- Closing balance line (may be split across lines in PDF extraction)
-    // Join every pair of consecutive lines to handle splitting
-    const lines = block.split("\n");
-    let closingLine = null;
-    for (let j = 0; j < lines.length; j++) {
-      const joined = lines.slice(j, j + 4).join(" ");
-      if (/Closing Unit Balance/i.test(joined)) {
-        closingLine = joined;
-        break;
-      }
+    for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
+      const l = lines[j];
+      if (!l || /^Nominee/i.test(l) || /PORTFOLIO|SUMMARY/i.test(l)) continue;
+      amcName = l;
+      break;
     }
 
-    let closingUnits = 0;
-    let navAtStatement = 0;
-    let costValue = 0;
+    fundDecls.push({ isin, schemeName, amcName, folioNumber, lineIdx: i });
+  }
 
-    if (closingLine) {
-      const cuMatch  = closingLine.match(/Closing Unit Balance:\s*([\d,]+\.?\d*)/i);
-      const navMatch = closingLine.match(/NAV on [^:]+:\s*INR\s*([\d,]+\.?\d*)/i);
-      const cvMatch  = closingLine.match(/Total Cost Value\s*:\s*INR\s*([\d,]+\.?\d*)/i);
-      if (cuMatch)  closingUnits    = parseNum(cuMatch[1]);
-      if (navMatch) navAtStatement  = parseNum(navMatch[1]);
-      if (cvMatch)  costValue       = parseNum(cvMatch[1]);
-    }
+  // --- Step 2: Closing balances in document order
+  const closingBalances = [];
+  for (let i = 0; i < lines.length; i++) {
+    const cb = lines[i].match(/Closing Unit Balance:\s*([\d,]+\.?\d*)/i);
+    if (!cb) continue;
+    // Total Cost Value is typically on the next line in KFINTECH CAS
+    const combined = lines[i] + " " + (lines[i + 1] || "");
+    const cv = combined.match(/Total Cost Value\s*:\s*INR\s*([\d,]+\.?\d*)/i);
+    closingBalances.push({
+      units:     parseNum(cb[1]),
+      costValue: cv ? parseNum(cv[1]) : 0,
+      lineIdx:   i,
+    });
+  }
 
-    // --- Scheme name: look for line containing the ISIN (usually "SchemeName - Growth Option   ISIN:XXXXX")
-    let schemeName = isin; // fallback
-    for (const line of lines) {
-      if (line.includes(isin)) {
-        // Scheme name is everything before "ISIN"
-        const beforeIsin = line.split(/ISIN/i)[0].trim().replace(/[-\s]+$/, "").trim();
-        if (beforeIsin.length > 5) { schemeName = beforeIsin; break; }
-      }
-    }
+  if (fundDecls.length !== closingBalances.length) {
+    console.warn(`[CAS] Fund/balance count mismatch: ${fundDecls.length} ISINs, ${closingBalances.length} closing balances`);
+  }
 
-    // --- Transaction lots (Purchase, Additional Purchase, SIP only)
-    const lots = [];
-    const TXN_RE = /^(\d{2}-[A-Z]{3}-\d{4})\s+(Purchase|Additional\s+Purchase|SIP)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)/i;
+  // --- Step 3: All purchase transactions
+  // Multi-line format in extracted text:
+  //   line i  : DD-MMM-YYYY          (date alone)
+  //   line i+1: Purchase[+ TrxnRef]  (type, possibly with reference suffix)
+  //   line i+2: 19,999.00            (amount)
+  //   line i+3: 423.10747.267        (units + nav concatenated — units always 3 dp)
+  const allTxns = [];
+  for (let i = 0; i < lines.length - 3; i++) {
+    if (!/^\d{2}-[A-Z]{3}-\d{4}$/.test(lines[i])) continue;
+    const typeLine = lines[i + 1] || "";
+    if (!/^(Purchase|Additional\s+Purchase|SIP)/i.test(typeLine)) continue;
 
-    for (const line of lines) {
-      if (/\*{3}/.test(line)) continue; // skip stamp duty / STT lines
-      if (/\([\d,]+\.?\d*\)/.test(line)) continue; // skip redemptions (neg in parentheses)
+    const amount = parseNum((lines[i + 2] || "").replace(/,/g, ""));
+    if (isNaN(amount) || amount <= 0) continue;
 
-      const m = line.trim().match(TXN_RE);
-      if (!m) continue;
+    // Split concatenated units+nav: units have exactly 3 decimal places
+    const unitsNavStr = (lines[i + 3] || "").replace(/,/g, "");
+    const unm = unitsNavStr.match(/^(\d+\.\d{3})(\d+\.\d+)$/);
+    if (!unm) continue;
 
-      const date   = parseIndianDate(m[1]);
-      const amount = parseNum(m[3]);
-      const units  = parseNum(m[4]);
-      const nav    = parseNum(m[5]);
+    const units = parseFloat(unm[1]);
+    const nav   = parseFloat(unm[2]);
+    if (isNaN(units) || units <= 0 || isNaN(nav)) continue;
 
-      if (!date || isNaN(amount) || isNaN(units) || isNaN(nav)) continue;
-      if (amount <= 0 || units <= 0) continue;
+    allTxns.push({ date: parseIndianDate(lines[i]), amount, units, nav, lineIdx: i });
+  }
 
-      lots.push({ date, units, nav, amount });
-    }
+  // --- Step 4: Assemble funds by matching decls→balances by index order
+  //             and filtering transactions into each fund's line range
+  const funds = [];
+  for (let i = 0; i < fundDecls.length; i++) {
+    const decl = fundDecls[i];
+    const cb   = closingBalances[i];
+    if (!cb) continue;
+
+    const startLine = i === 0 ? 0 : closingBalances[i - 1].lineIdx;
+    const endLine   = cb.lineIdx;
+
+    const lots = allTxns.filter((t) => t.lineIdx > startLine && t.lineIdx < endLine);
 
     funds.push({
-      isin,
-      scheme_code:    null, // resolved below
-      scheme_name:    schemeName,
-      amc_name:       amcName,
-      folio_number:   folioNumber,
-      closing_units:  closingUnits,
-      nav_at_statement: navAtStatement,
-      amount_invested:  costValue || lots.reduce((s, l) => s + l.amount, 0),
-      lookup_failed:  false,
+      isin:             decl.isin,
+      scheme_code:      null, // resolved below
+      scheme_name:      decl.schemeName,
+      amc_name:         decl.amcName,
+      folio_number:     decl.folioNumber,
+      closing_units:    cb.units,
+      nav_at_statement: 0,
+      amount_invested:  cb.costValue || lots.reduce((s, l) => s + l.amount, 0),
+      lookup_failed:    false,
       lots,
     });
   }
