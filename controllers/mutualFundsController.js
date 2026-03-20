@@ -407,39 +407,40 @@ const confirmCasImport = async (req, res) => {
     return fail(res, "No funds provided");
   }
 
+  // CAS is source of truth: wipe existing lots for every ISIN in this CAS, then re-insert fresh.
+  const isins = [...new Set(funds.filter((f) => f.isin).map((f) => f.isin))];
+
   const client = await pool.connect();
+  let deleted  = 0;
   let inserted = 0;
-  let skipped  = 0;
 
   try {
     await client.query("BEGIN");
 
-    for (const fund of funds) {
-      if (!fund.isin) continue;  // import even without scheme_code; current_value will be 0 until NAV refresh
+    // Delete all existing lots for these ISINs so re-upload is always a clean sync
+    const delResult = await client.query(
+      `DELETE FROM mutual_fund_holdings WHERE user_id = $1 AND isin = ANY($2)`,
+      [req.user_id, isins]
+    );
+    deleted = delResult.rowCount ?? 0;
 
-      const nav = await getNavForScheme(fund.scheme_code);
-      const latestNav      = nav?.latest_nav  ?? null;
-      const latestNavDate  = nav?.nav_date     ?? null;
+    for (const fund of funds) {
+      if (!fund.isin) continue;
+
+      const nav           = await getNavForScheme(fund.scheme_code);
+      const latestNav     = nav?.latest_nav ?? null;
+      const latestNavDate = nav?.nav_date   ?? null;
 
       for (const lot of (fund.lots ?? [])) {
-        const units         = parseFloat(lot.units)   || 0;
-        const purchaseNav   = parseFloat(lot.nav)     || 0;
-        const amountInvested = parseFloat(lot.amount) || units * purchaseNav;
-        const purchaseDate  = lot.date;
+        const units          = parseFloat(lot.units)   || 0;
+        const purchaseNav    = parseFloat(lot.nav)     || 0;
+        const amountInvested = parseFloat(lot.amount)  || units * purchaseNav;
+        const purchaseDate   = lot.date;
 
-        if (units <= 0 || !purchaseDate) { skipped++; continue; }
+        if (units <= 0 || !purchaseDate) continue;
 
-        // Dedup check
-        const dup = await client.query(
-          `SELECT id FROM mutual_fund_holdings
-           WHERE user_id = $1 AND isin = $2 AND folio_number = $3
-             AND purchase_date = $4 AND ABS(units - $5) < 0.001`,
-          [req.user_id, fund.isin, fund.folio_number ?? "UNKNOWN", purchaseDate, units]
-        );
-        if (dup.rows.length > 0) { skipped++; continue; }
-
-        const currentValue     = latestNav != null ? parseFloat((units * latestNav).toFixed(2)) : 0;
-        const absoluteReturn   = parseFloat((currentValue - amountInvested).toFixed(2));
+        const currentValue      = latestNav != null ? parseFloat((units * latestNav).toFixed(2)) : 0;
+        const absoluteReturn    = parseFloat((currentValue - amountInvested).toFixed(2));
         const absoluteReturnPct = amountInvested > 0
           ? parseFloat(((absoluteReturn / amountInvested) * 100).toFixed(2))
           : 0;
@@ -463,11 +464,7 @@ const confirmCasImport = async (req, res) => {
     }
 
     await client.query("COMMIT");
-    return success(res, {
-      message:  `Import complete`,
-      inserted,
-      skipped,
-    }, 201);
+    return success(res, { message: "Sync complete", inserted, deleted }, 201);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[mf/cas-confirm] Error:", err.message);
