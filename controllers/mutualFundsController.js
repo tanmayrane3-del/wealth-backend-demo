@@ -540,18 +540,20 @@ const getHoldings = async (req, res) => {
     for (const row of result.rows) {
       if (!fundMap[row.isin]) {
         fundMap[row.isin] = {
-          isin:         row.isin,
-          scheme_code:  row.scheme_code,
-          scheme_name:  row.scheme_name,
-          amc_name:     row.amc_name,
-          lots:         [],
+          isin:              row.isin,
+          scheme_code:       row.scheme_code,
+          scheme_name:       row.scheme_name,
+          amc_name:          row.amc_name,
+          stored_latest_nav: row.latest_nav     ? parseFloat(row.latest_nav)  : null,
+          stored_nav_date:   row.latest_nav_date ? String(row.latest_nav_date).slice(0, 10) : null,
+          lots:              [],
         };
       }
       fundMap[row.isin].lots.push({
-        id:             row.id,
-        purchase_date:  row.purchase_date?.toISOString?.()?.slice(0, 10) ?? String(row.purchase_date),
-        units:          parseFloat(row.units),
-        purchase_nav:   parseFloat(row.purchase_nav),
+        id:              row.id,
+        purchase_date:   row.purchase_date?.toISOString?.()?.slice(0, 10) ?? String(row.purchase_date),
+        units:           parseFloat(row.units),
+        purchase_nav:    parseFloat(row.purchase_nav),
         amount_invested: parseFloat(row.amount_invested),
       });
     }
@@ -562,9 +564,10 @@ const getHoldings = async (req, res) => {
     let totalCurrentValue = 0;
 
     for (const fund of Object.values(fundMap)) {
-      const nav     = navMap[fund.scheme_code];
-      const latestNav      = nav?.latest_nav  ?? null;
-      const latestNavDate  = nav?.nav_date     ?? null;
+      // Prefer live NAV from cache; fall back to what was stored at import time
+      const nav            = navMap[fund.scheme_code];
+      const latestNav      = nav?.latest_nav  ?? fund.stored_latest_nav ?? null;
+      const latestNavDate  = nav?.nav_date     ?? fund.stored_nav_date   ?? null;
 
       const totalUnits = fund.lots.reduce((s, l) => s + l.units, 0);
       const totalLotInvested = fund.lots.reduce((s, l) => s + l.amount_invested, 0);
