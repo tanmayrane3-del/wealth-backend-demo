@@ -180,7 +180,8 @@ const parseCasPdf = async (req, res) => {
 
   let text;
   try {
-    const pdfParse = require("pdf-parse");
+    const pdfParseModule = require("pdf-parse");
+    const pdfParse = pdfParseModule.default ?? pdfParseModule;
     const parsed = await pdfParse(req.file.buffer);
     text = parsed.text;
   } catch (err) {
