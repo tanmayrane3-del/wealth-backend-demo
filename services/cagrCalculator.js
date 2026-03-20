@@ -634,27 +634,12 @@ function initCagrScheduler() {
 async function recomputeStocksCagr(stocks) {
   if (!stocks || stocks.length === 0) return;
 
-  // Only process symbols with stale (>7 days) or missing CAGR
-  const staleResult = await pool.query(
-    `SELECT s.tradingsymbol, s.exchange
-     FROM unnest($1::text[], $2::text[]) AS s(tradingsymbol, exchange)
-     LEFT JOIN asset_cagr ac ON ac.symbol = s.tradingsymbol AND ac.asset_type = 'stock'
-     WHERE ac.last_updated_at IS NULL OR ac.last_updated_at < NOW() - INTERVAL '7 days'`,
-    [stocks.map((s) => s.tradingsymbol), stocks.map((s) => s.exchange)]
-  );
-
-  const stale = staleResult.rows;
-  if (stale.length === 0) {
-    console.log("[CAGR/Sync] All stocks fresh (< 7 days) — skipping");
-    return;
-  }
-
   console.log(
-    `[CAGR/Sync] Recomputing CAGR for ${stale.length} stale stock(s): ` +
-    stale.map((s) => s.tradingsymbol).join(", ")
+    `[CAGR/Sync] Recomputing CAGR for ${stocks.length} stock(s): ` +
+    stocks.map((s) => s.tradingsymbol).join(", ")
   );
 
-  const rows = await processStocks(stale);
+  const rows = await processStocks(stocks);
   if (rows.length > 0) await upsertCagrRows(rows);
 
   console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} stock(s)`);
