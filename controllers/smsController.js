@@ -64,7 +64,7 @@ const parseSmsAndRecord = async (req, res) => {
            FROM income_sources
            WHERE (user_id = $1 OR user_id IS NULL OR is_default = true)
              AND is_active = true
-             AND LOWER(source_identifier) = LOWER($2)
+             AND LOWER($2) = ANY(string_to_array(LOWER(source_identifier), '|'))
            LIMIT 1`,
           [user_id, parsed.payment_identifier]
         );
@@ -145,7 +145,7 @@ const parseSmsAndRecord = async (req, res) => {
            FROM recipients
            WHERE (user_id = $1 OR user_id IS NULL OR is_default = true)
              AND is_active = true
-             AND LOWER(payment_identifier) = LOWER($2)
+             AND LOWER($2) = ANY(string_to_array(LOWER(payment_identifier), '|'))
            LIMIT 1`,
           [user_id, parsed.payment_identifier]
         );
