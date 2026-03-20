@@ -437,22 +437,25 @@ const confirmCasImport = async (req, res) => {
     );
     deleted = delResult.rowCount ?? 0;
 
-    // Re-resolve any null scheme_codes via AMFI (handles mfapi.in being blocked on Render)
-    const nullIsinFunds = funds.filter((f) => f.isin && !f.scheme_code);
-    if (nullIsinFunds.length > 0) {
-      const amfiMap = await lookupIsinsFromAmfi(nullIsinFunds.map((f) => f.isin));
-      for (const fund of nullIsinFunds) {
-        if (amfiMap[fund.isin]) fund.scheme_code = amfiMap[fund.isin].scheme_code;
-      }
-    }
+    // Resolve scheme_code + NAV for all funds via AMFI in one shot.
+    // AMFI is the primary source — no IP restrictions unlike mfapi.in on Render.
+    const allIsinFunds = funds.filter((f) => f.isin);
+    const amfiNavMap   = await lookupIsinsFromAmfi(allIsinFunds.map((f) => f.isin));
 
     for (const fund of funds) {
       if (!fund.isin) continue;
 
-      const schemeCode = fund.scheme_code ?? null;
-      const nav           = await getNavForScheme(schemeCode);
-      const latestNav     = nav?.latest_nav ?? null;
-      const latestNavDate = nav?.nav_date   ?? null;
+      const amfi       = amfiNavMap[fund.isin];
+      const schemeCode = amfi?.scheme_code ?? fund.scheme_code ?? null;
+
+      // Use NAV straight from AMFI; fall back to mfapi.in cache only if AMFI missed it
+      let latestNav     = amfi?.latest_nav  ?? null;
+      let latestNavDate = amfi?.nav_date    ?? null;
+      if (latestNav == null && schemeCode) {
+        const cached = await getNavForScheme(schemeCode);
+        latestNav     = cached?.latest_nav ?? null;
+        latestNavDate = cached?.nav_date   ?? null;
+      }
 
       for (const lot of (fund.lots ?? [])) {
         const units          = parseFloat(lot.units)   || 0;
