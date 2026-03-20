@@ -10,6 +10,7 @@ const {
   getSummary,
   addLot,
   deleteLot,
+  syncNav,
   syncMfCagr,
 } = require("../controllers/mutualFundsController");
 
@@ -25,6 +26,7 @@ router.get("/holdings",        validate, getHoldings);
 router.get("/summary",         validate, getSummary);
 router.post("/holdings",       validate, addLot);
 router.delete("/holdings/:id", validate, deleteLot);
+router.post("/sync-nav",       validate, syncNav);
 router.post("/sync-cagr",      validate, syncMfCagr);
 
 module.exports = router;

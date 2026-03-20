@@ -508,6 +508,8 @@ const confirmCasImport = async (req, res) => {
 
 const getHoldings = async (req, res) => {
   try {
+    // Like stocks getHoldings: read stored values from DB — no live API calls.
+    // NAVs are refreshed by the separate POST /sync-nav endpoint.
     const result = await pool.query(
       `SELECT id, isin, scheme_code, scheme_name, folio_number, amc_name,
               units, purchase_nav, purchase_date, amount_invested,
@@ -523,30 +525,18 @@ const getHoldings = async (req, res) => {
       return success(res, { funds: [], summary: { total_invested: 0, current_value: 0, absolute_return: 0, absolute_return_pct: 0 } });
     }
 
-    // Collect unique scheme_codes for batch NAV refresh check
-    const schemeCodes = [...new Set(result.rows.map((r) => r.scheme_code).filter(Boolean))];
-
-    // Fetch fresh NAVs (uses 4h cache internally)
-    const navMap = {};
-    await Promise.all(
-      schemeCodes.map(async (sc) => {
-        const nav = await getNavForScheme(sc);
-        if (nav) navMap[sc] = nav;
-      })
-    );
-
-    // Group lots by ISIN
+    // Group lots by ISIN, using values already stored in DB
     const fundMap = {};
     for (const row of result.rows) {
       if (!fundMap[row.isin]) {
         fundMap[row.isin] = {
-          isin:              row.isin,
-          scheme_code:       row.scheme_code,
-          scheme_name:       row.scheme_name,
-          amc_name:          row.amc_name,
-          stored_latest_nav: row.latest_nav     ? parseFloat(row.latest_nav)  : null,
-          stored_nav_date:   row.latest_nav_date ? String(row.latest_nav_date).slice(0, 10) : null,
-          lots:              [],
+          isin:           row.isin,
+          scheme_code:    row.scheme_code,
+          scheme_name:    row.scheme_name,
+          amc_name:       row.amc_name,
+          latest_nav:     row.latest_nav      ? parseFloat(row.latest_nav)                            : null,
+          latest_nav_date: row.latest_nav_date ? String(row.latest_nav_date).slice(0, 10)             : null,
+          lots:           [],
         };
       }
       fundMap[row.isin].lots.push({
@@ -558,24 +548,22 @@ const getHoldings = async (req, res) => {
       });
     }
 
-    // Build aggregated fund objects
+    // Aggregate per-fund values from stored lot data
     const funds = [];
     let totalInvested = 0;
     let totalCurrentValue = 0;
 
     for (const fund of Object.values(fundMap)) {
-      // Prefer live NAV from cache; fall back to what was stored at import time
-      const nav            = navMap[fund.scheme_code];
-      const latestNav      = nav?.latest_nav  ?? fund.stored_latest_nav ?? null;
-      const latestNavDate  = nav?.nav_date     ?? fund.stored_nav_date   ?? null;
-
-      const totalUnits = fund.lots.reduce((s, l) => s + l.units, 0);
+      const totalUnits      = fund.lots.reduce((s, l) => s + l.units, 0);
       const totalLotInvested = fund.lots.reduce((s, l) => s + l.amount_invested, 0);
-      const avgNav = totalUnits > 0 ? totalLotInvested / totalUnits : 0;
+      const avgNav          = totalUnits > 0 ? totalLotInvested / totalUnits : 0;
+
+      const latestNav     = fund.latest_nav;
+      const latestNavDate = fund.latest_nav_date;
 
       const currentValue = latestNav != null
         ? parseFloat((totalUnits * latestNav).toFixed(2))
-        : fund.lots.reduce((s, l) => s + parseFloat(l.units) * parseFloat(l.purchase_nav), 0);
+        : fund.lots.reduce((s, l) => s + l.units * l.purchase_nav, 0);
 
       const absReturn    = parseFloat((currentValue - totalLotInvested).toFixed(2));
       const absReturnPct = totalLotInvested > 0
@@ -588,20 +576,20 @@ const getHoldings = async (req, res) => {
       totalCurrentValue += currentValue;
 
       funds.push({
-        isin:               fund.isin,
-        scheme_code:        fund.scheme_code,
-        scheme_name:        fund.scheme_name,
-        amc_name:           fund.amc_name,
-        total_units:        parseFloat(totalUnits.toFixed(3)),
-        avg_nav:            parseFloat(avgNav.toFixed(4)),
-        latest_nav:         latestNav,
-        latest_nav_date:    latestNavDate,
-        total_invested:     parseFloat(totalLotInvested.toFixed(2)),
-        current_value:      currentValue,
-        absolute_return:    absReturn,
+        isin:                fund.isin,
+        scheme_code:         fund.scheme_code,
+        scheme_name:         fund.scheme_name,
+        amc_name:            fund.amc_name,
+        total_units:         parseFloat(totalUnits.toFixed(3)),
+        avg_nav:             parseFloat(avgNav.toFixed(4)),
+        latest_nav:          latestNav,
+        latest_nav_date:     latestNavDate,
+        total_invested:      parseFloat(totalLotInvested.toFixed(2)),
+        current_value:       currentValue,
+        absolute_return:     absReturn,
         absolute_return_pct: absReturnPct,
         xirr,
-        lots:               fund.lots,
+        lots:                fund.lots,
       });
     }
 
@@ -816,6 +804,58 @@ const deleteLot = async (req, res) => {
 };
 
 // ---------------------------------------------------------------------------
+// POST /api/mutual-funds/sync-nav
+// Refresh NAVs from AMFI and update all holdings in DB (like stocks syncHoldings).
+// ---------------------------------------------------------------------------
+
+const syncNav = async (req, res) => {
+  try {
+    // Get all distinct ISINs for this user
+    const isinResult = await pool.query(
+      `SELECT DISTINCT isin FROM mutual_fund_holdings WHERE user_id = $1 AND isin IS NOT NULL`,
+      [req.user_id]
+    );
+    const isins = isinResult.rows.map((r) => r.isin);
+
+    if (isins.length === 0) {
+      return success(res, { message: "No MF holdings found", updated: 0 });
+    }
+
+    // Fetch all NAVs in a single AMFI pass
+    const amfiMap = await lookupIsinsFromAmfi(isins);
+
+    let updated = 0;
+    for (const isin of isins) {
+      const amfi = amfiMap[isin];
+      if (!amfi?.latest_nav) continue;
+
+      const latestNav     = amfi.latest_nav;
+      const latestNavDate = amfi.nav_date;
+
+      // Update current_value, absolute_return, absolute_return_pct for every lot of this ISIN
+      await pool.query(
+        `UPDATE mutual_fund_holdings
+         SET latest_nav          = $1,
+             latest_nav_date     = $2,
+             current_value       = ROUND((units * $1)::numeric, 2),
+             absolute_return     = ROUND((units * $1 - amount_invested)::numeric, 2),
+             absolute_return_pct = CASE WHEN amount_invested > 0
+                                     THEN ROUND(((units * $1 - amount_invested) / amount_invested * 100)::numeric, 2)
+                                     ELSE 0 END
+         WHERE user_id = $3 AND isin = $4`,
+        [latestNav, latestNavDate, req.user_id, isin]
+      );
+      updated++;
+    }
+
+    return success(res, { message: "NAV sync complete", updated, total_isins: isins.length });
+  } catch (err) {
+    console.error("[mf/sync-nav] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ---------------------------------------------------------------------------
 // POST /api/mutual-funds/sync-cagr
 // ---------------------------------------------------------------------------
 
@@ -852,5 +892,6 @@ module.exports = {
   getSummary,
   addLot,
   deleteLot,
+  syncNav,
   syncMfCagr,
 };
