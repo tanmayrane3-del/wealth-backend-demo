@@ -147,6 +147,23 @@ function cleanSchemeNameForSearch(name) {
   return clean;
 }
 
+/**
+ * From mfapi.in search results, pick the scheme that best matches the original fund name.
+ * Prefers the same plan type (Direct vs Regular) and Growth over IDCW/Dividend.
+ */
+function pickBestScheme(results, originalName) {
+  const isDirect = /direct/i.test(originalName);
+  const planPref  = isDirect ? /direct/i : /regular/i;
+
+  // Filter to matching plan; fall back to all results if none match
+  const planMatches = results.filter((r) => planPref.test(r.schemeName));
+  const pool = planMatches.length > 0 ? planMatches : results;
+
+  // Within that, prefer Growth over IDCW/Dividend
+  const growthMatch = pool.find((r) => /growth/i.test(r.schemeName));
+  return growthMatch || pool[0];
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/mutual-funds/lookup?isin=XX
 // ---------------------------------------------------------------------------
@@ -206,6 +223,17 @@ const parseCasPdf = async (req, res) => {
     if (nonZero.length === 0) {
       return fail(res, "No active holdings found in this CAS");
     }
+
+    // Enrich preview with current NAV so the app can display current value
+    await Promise.all(
+      nonZero.map(async (fund) => {
+        const nav = await getNavForScheme(fund.scheme_code);
+        fund.current_nav  = nav?.latest_nav  ?? null;
+        fund.current_value = nav?.latest_nav != null
+          ? parseFloat((fund.closing_units * nav.latest_nav).toFixed(2))
+          : null;
+      })
+    );
 
     return success(res, { funds: nonZero, total_funds: nonZero.length });
   } catch (err) {
@@ -351,7 +379,7 @@ async function extractFundsFromCas(text) {
         }
 
         if (results.length > 0) {
-          schemeMap[isin] = String(results[0].schemeCode);
+          schemeMap[isin] = String(pickBestScheme(results, isinToName[isin] || "").schemeCode);
         }
       })
     );
