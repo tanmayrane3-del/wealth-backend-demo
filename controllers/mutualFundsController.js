@@ -135,6 +135,17 @@ function parseIndianDate(s) {
 /** Strip commas and parse float */
 const parseNum = (s) => parseFloat(String(s).replace(/,/g, ""));
 
+/**
+ * Clean a CAS-extracted scheme name for use as a mfapi.in ?q= search query.
+ * KFINTECH PDFs sometimes prepend a folio-code like "117 TSD1G-" before the real name.
+ * These codes always start with a digit, so only strip when the name starts with one.
+ */
+function cleanSchemeNameForSearch(name) {
+  let clean = name.replace(/^\d[\w ]*-(?=[A-Z])/i, "").trim();
+  clean = clean.replace(/\s*[-–]\s*(Regular Plan|Direct Plan|Regular|Direct|Growth|IDCW).*$/i, "").trim();
+  return clean;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/mutual-funds/lookup?isin=XX
 // ---------------------------------------------------------------------------
@@ -312,25 +323,34 @@ async function extractFundsFromCas(text) {
     });
   }
 
-  // Resolve scheme_codes in parallel batches of 5
+  // Resolve scheme_codes in parallel batches of 5.
+  // mfapi.in ?isin= is currently broken (HTTP 500), so fall back to ?q=scheme_name.
   const isins = [...new Set(funds.map((f) => f.isin))];
   const schemeMap = {};
+  const isinToName = Object.fromEntries(funds.map((f) => [f.isin, f.scheme_name]));
 
   for (let i = 0; i < isins.length; i += 5) {
     const batch = isins.slice(i, i + 5);
     await Promise.all(
       batch.map(async (isin) => {
+        // Try ?isin= first (fast, direct)
+        let results = [];
         try {
-          const r = await axios.get(
-            `${MFAPI_BASE}/search?isin=${encodeURIComponent(isin)}`,
-            { timeout: 8000 }
-          );
-          const results = r.data;
-          if (Array.isArray(results) && results.length > 0) {
-            schemeMap[isin] = String(results[0].schemeCode);
-          }
-        } catch {
-          // lookup_failed stays true
+          const r = await axios.get(`${MFAPI_BASE}/search?isin=${encodeURIComponent(isin)}`, { timeout: 8000 });
+          if (Array.isArray(r.data) && r.data.length > 0) results = r.data;
+        } catch { /* fall through to name search */ }
+
+        // Fallback: ?q=scheme_name (more robust)
+        if (results.length === 0) {
+          try {
+            const query = cleanSchemeNameForSearch(isinToName[isin] || isin);
+            const r = await axios.get(`${MFAPI_BASE}/search?q=${encodeURIComponent(query)}`, { timeout: 8000 });
+            if (Array.isArray(r.data) && r.data.length > 0) results = r.data;
+          } catch { /* give up */ }
+        }
+
+        if (results.length > 0) {
+          schemeMap[isin] = String(results[0].schemeCode);
         }
       })
     );
@@ -366,7 +386,7 @@ const confirmCasImport = async (req, res) => {
     await client.query("BEGIN");
 
     for (const fund of funds) {
-      if (fund.lookup_failed || !fund.isin) continue;
+      if (!fund.isin) continue;  // import even without scheme_code; current_value will be 0 until NAV refresh
 
       const nav = await getNavForScheme(fund.scheme_code);
       const latestNav      = nav?.latest_nav  ?? null;
