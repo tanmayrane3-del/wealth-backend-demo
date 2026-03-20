@@ -142,6 +142,7 @@ const parseNum = (s) => parseFloat(String(s).replace(/,/g, ""));
  */
 function cleanSchemeNameForSearch(name) {
   let clean = name.replace(/^\d[\w ]*-(?=[A-Z])/i, "").trim();
+  clean = clean.replace(/\s*\([^)]*\)/g, "").trim();  // strip parentheticals: (formerly...) (Advisor:...)
   clean = clean.replace(/\s*[-–]\s*(Regular Plan|Direct Plan|Regular|Direct|Growth|IDCW).*$/i, "").trim();
   return clean;
 }
