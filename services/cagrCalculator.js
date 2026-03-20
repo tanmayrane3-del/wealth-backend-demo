@@ -19,8 +19,9 @@ function getSheetsClient() {
   return _sheetsClient;
 }
 
-const SHEET_ID   = process.env.GOOGLE_SHEET_ID;
-const SHEET_NAME = "StockPrices";
+const SHEET_ID      = process.env.GOOGLE_SHEET_ID;
+const SHEET_NAME    = "StockPrices";
+const SHEET_NAME_MF = "MFNavs";
 
 // ---------------------------------------------------------------------------
 // Config & Constants
@@ -313,140 +314,166 @@ async function processStocks(stocks) {
 }
 
 // ---------------------------------------------------------------------------
-// Mutual Fund CAGR
+// Mutual Fund CAGR  (Google Sheets-based — same pattern as stocks)
 // ---------------------------------------------------------------------------
 
 /**
- * Find a row in mfapi NAV history (newest-first) closest to targetDate.
- * Format: [{ date: "DD-MM-YYYY", nav: "123.45" }, ...]
+ * Ensures all ISINs have a row in the MFNavs sheet (columns A–F):
+ *   A: ISIN | B: scheme_code | C: nav_current | D: nav_1y | E: nav_3y | F: nav_5y
+ *
+ * The backend only writes A & B.  Columns C–F are filled by a Google Apps Script
+ * that runs from Google's servers (no Render IP block) and calls mfapi.in.
+ * Returns { [isin]: scheme_code } for all ISINs that have a scheme_code in the DB.
  */
-function findMfNav(navData, targetDate) {
-  const target = targetDate.getTime();
-  let best = null;
-  let bestDiff = Infinity;
-  for (const row of navData) {
-    const [d, m, y] = row.date.split("-").map(Number);
-    const t = new Date(y, m - 1, d).getTime();
-    const diff = Math.abs(t - target);
-    if (diff < bestDiff) { bestDiff = diff; best = row; }
+async function syncMfSheetIsins(isins) {
+  if (!SHEET_ID || isins.length === 0) return {};
+
+  // Resolve scheme_codes from DB (set at CAS import via AMFI lookup)
+  const result = await pool.query(
+    `SELECT DISTINCT isin, scheme_code FROM mutual_fund_holdings
+     WHERE isin = ANY($1) AND scheme_code IS NOT NULL`,
+    [isins]
+  );
+  const isinToScheme = {};
+  for (const row of result.rows) isinToScheme[row.isin] = row.scheme_code;
+
+  const sheets = getSheetsClient();
+
+  // Read existing ISINs already in the sheet
+  let existingIsins = [];
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_NAME_MF}!A:A`,
+    });
+    existingIsins = (res.data.values || []).flat().filter((v) => v && v !== "ISIN");
+  } catch { /* sheet might not exist yet — append will create it */ }
+
+  const missing = isins.filter((isin) => !existingIsins.includes(isin) && isinToScheme[isin]);
+  if (missing.length === 0) {
+    console.log("[CAGR/MF-Sheet] All ISINs already in sheet");
+    return isinToScheme;
   }
-  return best ? parseFloat(best.nav) : null;
+
+  const rows = [];
+  if (existingIsins.length === 0) {
+    rows.push(["ISIN", "scheme_code", "nav_current", "nav_1y", "nav_3y", "nav_5y"]);
+  }
+  for (const isin of missing) {
+    rows.push([isin, isinToScheme[isin], "", "", "", ""]);
+  }
+
+  console.log(`[CAGR/MF-Sheet] Adding ${missing.length} new ISIN(s): ${missing.join(", ")}`);
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME_MF}!A:F`,
+    valueInputOption: "RAW",
+    resource: { values: rows },
+  });
+
+  return isinToScheme;
 }
 
+/**
+ * Reads NAV history from the MFNavs sheet (populated by Apps Script).
+ * Returns { [isin]: { current, p1y, p3y, p5y, scheme_code } }
+ */
+async function readMfNavsFromSheet(isins) {
+  if (!SHEET_ID || isins.length === 0) return {};
+  const sheets = getSheetsClient();
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME_MF}!A:F`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+
+  const rows    = res.data.values || [];
+  const isinSet = new Set(isins);
+  const navMap  = {};
+
+  for (const row of rows) {
+    const isin = String(row[0] || "").trim();
+    if (!isin || isin === "ISIN" || !isinSet.has(isin)) continue;
+
+    const current = parseFloat(row[2]) || null;
+    if (!current) continue; // Apps Script hasn't populated this ISIN yet
+
+    navMap[isin] = {
+      current,
+      p1y:         parseFloat(row[3]) || null,
+      p3y:         parseFloat(row[4]) || null,
+      p5y:         parseFloat(row[5]) || null,
+      scheme_code: String(row[1] || ""),
+    };
+  }
+
+  return navMap;
+}
+
+/**
+ * processMFs — same pattern as processStocks:
+ *   1. Ensure ISINs are in MFNavs sheet (write A & B)
+ *   2. Read NAV history from sheet (filled by Apps Script)
+ *   3. Compute CAGR and return rows for upsert
+ */
 async function processMFs(isins) {
   const rows = [];
-  const today       = new Date();
-  const oneYrAgo    = new Date(today); oneYrAgo.setFullYear(today.getFullYear() - 1);
-  const threeYrsAgo = new Date(today); threeYrsAgo.setFullYear(today.getFullYear() - 3);
-  const fiveYrsAgo  = new Date(today); fiveYrsAgo.setFullYear(today.getFullYear() - 5);
+
+  if (!SHEET_ID) {
+    console.error("[CAGR/MF] GOOGLE_SHEET_ID not set — skipping MFs");
+    return rows;
+  }
+  if (isins.length === 0) return rows;
+
+  await syncMfSheetIsins(isins);
+  const navMap = await readMfNavsFromSheet(isins);
 
   for (const isin of isins) {
-    try {
-      // Check for cached scheme_code first
-      const cached = await pool.query(
-        "SELECT scheme_code FROM asset_cagr WHERE isin = $1 AND asset_type = 'mf' LIMIT 1",
-        [isin]
-      );
-
-      let schemeCode = cached.rows[0]?.scheme_code;
-
-      if (!schemeCode) {
-        const searchRes = await axios.get(
-          `https://api.mfapi.in/mf/search?q=${encodeURIComponent(isin)}`,
-          { timeout: 10000 }
-        );
-        const results = searchRes.data;
-        if (!results || results.length === 0) {
-          console.warn(`[CAGR/MF] No scheme found for ISIN ${isin} — skipping`);
-          await sleep(300);
-          continue;
-        }
-        schemeCode = String(results[0].schemeCode);
-      }
-
-      // Fetch full NAV history
-      const navRes = await axios.get(
-        `https://api.mfapi.in/mf/${schemeCode}`,
-        { timeout: 15000 }
-      );
-      const navData = navRes.data?.data; // newest-first
-      if (!navData || navData.length < 2) {
-        console.warn(`[CAGR/MF] Insufficient NAV history for ${isin} — skipping`);
-        await sleep(300);
-        continue;
-      }
-
-      const latestNav = parseFloat(navData[0].nav);
-
-      // Determine available history in years
-      const [d, m, y] = navData[navData.length - 1].date.split("-").map(Number);
-      const oldestDate = new Date(y, m - 1, d);
-      const availYears = (today - oldestDate) / (365.25 * 24 * 3600 * 1000);
-
-      // 1-year CAGR
-      let cagr1y;
-      if (availYears >= 1) {
-        const nav1 = findMfNav(navData, oneYrAgo);
-        cagr1y = computeCagr(nav1, latestNav, 1) ?? BENCHMARKS.mf;
-      } else {
-        cagr1y = BENCHMARKS.mf;
-      }
-
-      // 3-year CAGR
-      let cagr3y;
-      if (availYears >= 3) {
-        const nav3 = findMfNav(navData, threeYrsAgo);
-        cagr3y = computeCagr(nav3, latestNav, 3) ?? BENCHMARKS.mf;
-      } else if (availYears >= 1) {
-        const nav1 = findMfNav(navData, oneYrAgo);
-        const raw = computeCagr(nav1, latestNav, Math.max(availYears, 1)) ?? BENCHMARKS.mf;
-        cagr3y = blendWithBenchmark(raw, availYears, 3, BENCHMARKS.mf);
-      } else {
-        cagr3y = BENCHMARKS.mf;
-      }
-
-      // 5-year CAGR
-      let cagr5y;
-      if (availYears >= 5) {
-        const nav5 = findMfNav(navData, fiveYrsAgo);
-        cagr5y = computeCagr(nav5, latestNav, 5) ?? BENCHMARKS.mf;
-      } else if (availYears >= 1) {
-        const navOld = findMfNav(navData, fiveYrsAgo);
-        const raw = computeCagr(navOld, latestNav, Math.max(availYears, 1)) ?? BENCHMARKS.mf;
-        cagr5y = blendWithBenchmark(raw, availYears, 5, BENCHMARKS.mf);
-      } else {
-        cagr5y = BENCHMARKS.mf;
-      }
-
-      cagr1y = applyFloorAndCap(cagr1y, CAPS.mf);
-      cagr3y = applyFloorAndCap(cagr3y, CAPS.mf);
-      cagr5y = applyFloorAndCap(cagr5y, CAPS.mf);
-
-      const mults = computeMultipliers(cagr1y, cagr3y, cagr5y);
-
-      rows.push({
-        symbol:      isin,
-        asset_type:  "mf",
-        exchange:    null,
-        isin,
-        scheme_code: schemeCode,
-        category:    null,
-        cagr_1y:     parseFloat(cagr1y.toFixed(4)),
-        cagr_3y:     parseFloat(cagr3y.toFixed(4)),
-        cagr_5y:     parseFloat(cagr5y.toFixed(4)),
-        ...mults,
-        cagr_source: "mfapi.in",
-      });
-
-      console.log(
-        `[CAGR/MF] ${isin} (${schemeCode}) | ` +
-        `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
-      );
-    } catch (err) {
-      console.error(`[CAGR/MF] Skipped ${isin}: ${err.message}`);
+    const navs = navMap[isin];
+    if (!navs?.current) {
+      console.warn(`[CAGR/MF] ${isin}: no NAV data in sheet yet — run Apps Script then retry`);
+      continue;
     }
 
-    await sleep(300);
+    const { current, p1y, p3y, p5y, scheme_code } = navs;
+
+    // Identical CAGR logic to processStocks
+    let cagr1y = p1y
+      ? (computeCagr(p1y, current, 1) ?? BENCHMARKS.mf)
+      : BENCHMARKS.mf;
+
+    let cagr3y = p3y
+      ? (computeCagr(p3y, current, 3) ?? blendWithBenchmark(cagr1y, 1, 3, BENCHMARKS.mf))
+      : blendWithBenchmark(cagr1y, 1, 3, BENCHMARKS.mf);
+
+    let cagr5y = p5y
+      ? (computeCagr(p5y, current, 5) ?? blendWithBenchmark(cagr1y, 1, 5, BENCHMARKS.mf))
+      : blendWithBenchmark(cagr1y, 1, 5, BENCHMARKS.mf);
+
+    cagr1y = applyFloorAndCap(cagr1y, CAPS.mf);
+    cagr3y = applyFloorAndCap(cagr3y, CAPS.mf);
+    cagr5y = applyFloorAndCap(cagr5y, CAPS.mf);
+
+    rows.push({
+      symbol:      isin,
+      asset_type:  "mf",
+      exchange:    null,
+      isin,
+      scheme_code,
+      category:    null,
+      cagr_1y:     parseFloat(cagr1y.toFixed(4)),
+      cagr_3y:     parseFloat(cagr3y.toFixed(4)),
+      cagr_5y:     parseFloat(cagr5y.toFixed(4)),
+      ...computeMultipliers(cagr1y, cagr3y, cagr5y),
+      cagr_source: "google-sheets/mfapi.in",
+    });
+
+    console.log(
+      `[CAGR/MF] ${isin} (${scheme_code}) via sheet | ` +
+      `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
+    );
   }
 
   return rows;
