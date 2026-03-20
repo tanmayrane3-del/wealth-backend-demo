@@ -38,7 +38,8 @@ async function lookupIsinsFromAmfi(isins) {
       }
     }
     return result;
-  } catch {
+  } catch (err) {
+    console.error("[AMFI] Fetch failed:", err.message);
     return {};
   }
 }
@@ -441,6 +442,7 @@ const confirmCasImport = async (req, res) => {
     // AMFI is the primary source — no IP restrictions unlike mfapi.in on Render.
     const allIsinFunds = funds.filter((f) => f.isin);
     const amfiNavMap   = await lookupIsinsFromAmfi(allIsinFunds.map((f) => f.isin));
+    console.log("[mf/cas-confirm] AMFI results:", JSON.stringify(amfiNavMap));
 
     for (const fund of funds) {
       if (!fund.isin) continue;
