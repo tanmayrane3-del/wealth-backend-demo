@@ -619,9 +619,11 @@ const getHoldings = async (req, res) => {
 
 const getSummary = async (req, res) => {
   try {
+    // Like stocks getHoldingsSummary: read pre-computed values from DB — no live API calls.
     const [holdingsRes, cagrRes] = await Promise.all([
       pool.query(
-        `SELECT isin, scheme_code, units, purchase_nav, amount_invested
+        `SELECT isin, amount_invested, current_value,
+                COALESCE(day_pnl, 0) AS day_pnl
          FROM mutual_fund_holdings WHERE user_id = $1`,
         [req.user_id]
       ),
@@ -633,67 +635,45 @@ const getSummary = async (req, res) => {
 
     if (holdingsRes.rows.length === 0) {
       return success(res, {
-        total_invested: 0, current_value: 0,
+        total_invested: 0, current_value: 0, total_day_pnl: 0,
         absolute_return: 0, absolute_return_pct: 0,
         projected_1y: 0, projected_3y: 0, projected_5y: 0, has_cagr: false,
       });
     }
 
-    // Build CAGR map: isin → multipliers
     const cagrMap = {};
     for (const row of cagrRes.rows) {
-      cagrMap[row.symbol] = {
-        m1: row.multiplier_1y,
-        m3: row.multiplier_3y,
-        m5: row.multiplier_5y,
-      };
+      cagrMap[row.symbol] = { m1: row.multiplier_1y, m3: row.multiplier_3y, m5: row.multiplier_5y };
     }
 
-    // Group by ISIN to get fresh NAVs
-    const schemeMap = {};
+    // Aggregate directly from stored DB values (current_value already computed by sync-nav)
+    const isinTotals = {};
     for (const row of holdingsRes.rows) {
-      if (!schemeMap[row.isin]) schemeMap[row.isin] = row.scheme_code;
+      if (!isinTotals[row.isin]) isinTotals[row.isin] = { invested: 0, cv: 0, dayPnl: 0 };
+      isinTotals[row.isin].invested += parseFloat(row.amount_invested);
+      isinTotals[row.isin].cv      += parseFloat(row.current_value || row.amount_invested);
+      isinTotals[row.isin].dayPnl  += parseFloat(row.day_pnl);
     }
 
-    const navMap = {};
-    await Promise.all(
-      Object.entries(schemeMap).map(async ([isin, sc]) => {
-        const nav = await getNavForScheme(sc);
-        if (nav) navMap[isin] = nav.latest_nav;
-      })
-    );
-
-    let totalInvested = 0, currentValue = 0, p1 = 0, p3 = 0, p5 = 0;
+    let totalInvested = 0, currentValue = 0, totalDayPnl = 0;
+    let p1 = 0, p3 = 0, p5 = 0;
     let hasCagr = false;
 
-    // Group lots by ISIN
-    const grouped = {};
-    for (const row of holdingsRes.rows) {
-      if (!grouped[row.isin]) grouped[row.isin] = [];
-      grouped[row.isin].push(row);
-    }
-
-    for (const [isin, lots] of Object.entries(grouped)) {
-      const latestNav = navMap[isin] ?? null;
-      const totalUnits = lots.reduce((s, l) => s + parseFloat(l.units), 0);
-      const lotInvested = lots.reduce((s, l) => s + parseFloat(l.amount_invested), 0);
-      const cv = latestNav != null
-        ? totalUnits * latestNav
-        : lotInvested;
-
-      totalInvested += lotInvested;
-      currentValue  += cv;
+    for (const [isin, totals] of Object.entries(isinTotals)) {
+      totalInvested += totals.invested;
+      currentValue  += totals.cv;
+      totalDayPnl   += totals.dayPnl;
 
       const cagr = cagrMap[isin];
       if (cagr) {
         hasCagr = true;
-        p1 += cv * (cagr.m1 ?? 1);
-        p3 += cv * (cagr.m3 ?? 1);
-        p5 += cv * (cagr.m5 ?? 1);
+        p1 += totals.cv * (cagr.m1 ?? 1);
+        p3 += totals.cv * (cagr.m3 ?? 1);
+        p5 += totals.cv * (cagr.m5 ?? 1);
       } else {
-        p1 += cv;
-        p3 += cv;
-        p5 += cv;
+        p1 += totals.cv;
+        p3 += totals.cv;
+        p5 += totals.cv;
       }
     }
 
@@ -705,6 +685,7 @@ const getSummary = async (req, res) => {
     return success(res, {
       total_invested:      parseFloat(totalInvested.toFixed(2)),
       current_value:       parseFloat(currentValue.toFixed(2)),
+      total_day_pnl:       parseFloat(totalDayPnl.toFixed(2)),
       absolute_return:     absReturn,
       absolute_return_pct: absReturnPct,
       projected_1y:        parseFloat(p1.toFixed(2)),
@@ -821,6 +802,13 @@ const syncNav = async (req, res) => {
       return success(res, { message: "No MF holdings found", updated: 0 });
     }
 
+    // Ensure close_nav and day_pnl columns exist (idempotent one-time migration)
+    await pool.query(`
+      ALTER TABLE mutual_fund_holdings
+        ADD COLUMN IF NOT EXISTS close_nav NUMERIC,
+        ADD COLUMN IF NOT EXISTS day_pnl   NUMERIC DEFAULT 0
+    `);
+
     // Fetch all NAVs in a single AMFI pass
     const amfiMap = await lookupIsinsFromAmfi(isins);
 
@@ -829,21 +817,34 @@ const syncNav = async (req, res) => {
       const amfi = amfiMap[isin];
       if (!amfi?.latest_nav) continue;
 
-      const latestNav     = amfi.latest_nav;
+      const newNav        = amfi.latest_nav;
       const latestNavDate = amfi.nav_date;
 
-      // Update current_value, absolute_return, absolute_return_pct for every lot of this ISIN
+      // Snapshot current latest_nav as close_nav before overwriting.
+      // If close_nav is already set and nav_date matches today, don't overwrite
+      // (already synced today — keep yesterday's close).
+      // If no close_nav yet, use current latest_nav so day_pnl starts at 0.
       await pool.query(
         `UPDATE mutual_fund_holdings
-         SET latest_nav          = $1,
+         SET close_nav           = COALESCE(
+                                     CASE WHEN latest_nav_date < $2 THEN latest_nav ELSE close_nav END,
+                                     latest_nav,
+                                     $1
+                                   ),
+             latest_nav          = $1,
              latest_nav_date     = $2,
+             day_pnl             = ROUND((units * ($1 - COALESCE(
+                                     CASE WHEN latest_nav_date < $2 THEN latest_nav ELSE close_nav END,
+                                     latest_nav,
+                                     $1
+                                   )))::numeric, 2),
              current_value       = ROUND((units * $1)::numeric, 2),
              absolute_return     = ROUND((units * $1 - amount_invested)::numeric, 2),
              absolute_return_pct = CASE WHEN amount_invested > 0
                                      THEN ROUND(((units * $1 - amount_invested) / amount_invested * 100)::numeric, 2)
                                      ELSE 0 END
          WHERE user_id = $3 AND isin = $4`,
-        [latestNav, latestNavDate, req.user_id, isin]
+        [newNav, latestNavDate, req.user_id, isin]
       );
       updated++;
     }
