@@ -1,16 +1,30 @@
-const cron    = require("node-cron");
-const axios   = require("axios");
-const pool    = require("../db");
+const cron  = require("node-cron");
+const axios  = require("axios");
+const pool   = require("../db");
+const { google } = require("googleapis");
 
-// yahoo-finance2 v3 requires instantiation via `new`.
-const YahooFinance = require("yahoo-finance2").default;
-const yf = new YahooFinance({ suppressNotices: ["yahooSurvey", "ripHistorical"] });
+// ---------------------------------------------------------------------------
+// Google Sheets client (service-account auth)
+// ---------------------------------------------------------------------------
+
+let _sheetsClient = null;
+function getSheetsClient() {
+  if (_sheetsClient) return _sheetsClient;
+  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY || "{}");
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+  _sheetsClient = google.sheets({ version: "v4", auth });
+  return _sheetsClient;
+}
+
+const SHEET_ID   = process.env.GOOGLE_SHEET_ID;
+const SHEET_NAME = "StockPrices";
 
 // ---------------------------------------------------------------------------
 // Config & Constants
 // ---------------------------------------------------------------------------
-
-const RATE_LIMIT_MS = 10_000; // 10 s between Yahoo Finance calls
 
 const CAPS = {
   LARGE_CAP: 0.25, // 25% ceiling for large-cap stocks
@@ -27,18 +41,41 @@ const BENCHMARKS = {
   metal: 0.08, // 8%  blended benchmark for metals
 };
 
-// SEBI market-cap thresholds in USD
-// Large cap: top ~100 companies  (~₹20,000 crore = ~$2.4B at ₹83/USD)
-// Mid cap:   101–250             (~₹5,000 crore  = ~$600M)
-const LARGE_CAP_USD = 2_400_000_000;
-const MID_CAP_USD   =   600_000_000;
+// Static Nifty 100 classification (Nifty50 + Nifty Next50 = large cap, rest = mid cap)
+// Avoids live market-cap lookups — updated manually when index rebalances.
+const NIFTY50 = new Set([
+  "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK",
+  "BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BPCL","BHARTIARTL",
+  "BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY",
+  "EICHERMOT","GRASIM","HCLTECH","HDFCBANK","HDFCLIFE",
+  "HEROMOTOCO","HINDALCO","HINDUNILVR","ICICIBANK","ITC",
+  "INDUSINDBK","INFY","JSWSTEEL","KOTAKBANK","LT",
+  "M&M","MARUTI","NESTLEIND","NTPC","ONGC",
+  "POWERGRID","RELIANCE","SBILIFE","SBIN","SUNPHARMA",
+  "TCS","TATACONSUM","TATAMOTORS","TATASTEEL","TECHM",
+  "TITAN","ULTRACEMCO","WIPRO","UPL","VEDL",
+]);
 
-// metal_type (from metal_holdings table) → Yahoo Finance ETF ticker
-const METAL_TICKERS = {
-  physical_gold: "GOLDBEES.NS",
-  digital_gold:  "GOLDBEES.NS",
-  sgb:           "GOLDBEES.NS",
-};
+const NIFTY_NEXT50 = new Set([
+  "ABB","ADANIGREEN","ADANITRANS","AMBUJACEM","AUROPHARMA",
+  "BANDHANBNK","BANKBARODA","BERGEPAINT","BEL","BOSCHLTD",
+  "CANBK","CHOLAFIN","COLPAL","CONCOR","CUMMINSIND",
+  "DLF","DABUR","DMART","GAIL","GODREJCP",
+  "GODREJPROP","HAVELLS","ICICIGI","ICICIPRULI","INDUSTOWER",
+  "INDIGO","IOC","IRCTC","JSWENERGY","LTF",
+  "LTIM","LUPIN","MCDOWELL-N","MFSL","MOTHERSON",
+  "MPHASIS","MRF","NAUKRI","NMDC","OFSS",
+  "PAGEIND","PIDILITIND","PIIND","PNB","RECLTD",
+  "SAIL","SHRIRAMFIN","SIEMENS","TATAPOWER","TRENT",
+]);
+
+function classifyBySymbol(tradingsymbol) {
+  const sym = tradingsymbol.toUpperCase();
+  if (NIFTY50.has(sym) || NIFTY_NEXT50.has(sym)) {
+    return { category: "LARGE_CAP", cap: CAPS.LARGE_CAP };
+  }
+  return { category: "MID_CAP", cap: CAPS.MID_CAP };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -61,8 +98,6 @@ function computeCagr(startPrice, endPrice, years) {
 /**
  * When fewer years of history are available than the target period,
  * blend the calculated CAGR with a conservative benchmark.
- * e.g. if we only have 2y of data for a 3y period:
- *   blended = calcCagr * (2/3) + benchmark * (1/3)
  */
 function blendWithBenchmark(cagr, availableYears, targetYears, benchmark) {
   if (availableYears >= targetYears) return cagr;
@@ -89,30 +124,80 @@ function computeMultipliers(cagr1y, cagr3y, cagr5y) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Google Sheets helpers
+// ---------------------------------------------------------------------------
+
 /**
- * Given a monthly-sorted array (oldest→newest) of { date, close } objects,
- * find the close price closest to `targetDate`.
+ * Ensures all symbols have a row in the StockPrices sheet.
+ * Appends missing symbols with GOOGLEFINANCE formulas for 4 price points.
  */
-function findClosestPrice(history, targetDate) {
-  if (!history || history.length === 0) return null;
-  const target = targetDate.getTime();
-  let best = history[0];
-  let bestDiff = Math.abs(new Date(best.date).getTime() - target);
-  for (const row of history) {
-    const diff = Math.abs(new Date(row.date).getTime() - target);
-    if (diff < bestDiff) { bestDiff = diff; best = row; }
+async function syncSheetSymbols(symbols) {
+  if (!SHEET_ID || symbols.length === 0) return;
+  const sheets = getSheetsClient();
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:A`,
+  });
+  const existing = (res.data.values || []).flat();
+
+  const missing = symbols.filter((s) => !existing.includes(s));
+  if (missing.length === 0) {
+    console.log("[CAGR/Sheet] All symbols already in sheet");
+    return;
   }
-  return best?.close ?? best?.adjclose ?? null;
+
+  console.log(`[CAGR/Sheet] Adding ${missing.length} new symbol(s): ${missing.join(", ")}`);
+
+  const rows = missing.map((sym) => [
+    sym,
+    `=GOOGLEFINANCE("${sym}","price")`,
+    `=IFERROR(INDEX(GOOGLEFINANCE("${sym}","price",TODAY()-366,TODAY()-359,"DAILY"),2,2),"")`,
+    `=IFERROR(INDEX(GOOGLEFINANCE("${sym}","price",TODAY()-1097,TODAY()-1090,"DAILY"),2,2),"")`,
+    `=IFERROR(INDEX(GOOGLEFINANCE("${sym}","price",TODAY()-1827,TODAY()-1820,"DAILY"),2,2),"")`,
+  ]);
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:E`,
+    valueInputOption: "USER_ENTERED",
+    resource: { values: rows },
+  });
+
+  // Give Google time to evaluate the new formulas
+  console.log("[CAGR/Sheet] Waiting 8s for formula evaluation…");
+  await sleep(8_000);
 }
 
 /**
- * Compute how many years of history are available in a monthly series.
+ * Reads columns A–E from the sheet and returns a price map.
+ * Returns: { "NSE:HDFCBANK": { current, p1y, p3y, p5y }, ... }
  */
-function availableYears(history) {
-  if (!history || history.length < 2) return 0;
-  const oldest = new Date(history[0].date).getTime();
-  const newest = new Date(history[history.length - 1].date).getTime();
-  return (newest - oldest) / (365.25 * 24 * 3600 * 1000);
+async function readSheetPrices(symbols) {
+  if (!SHEET_ID || symbols.length === 0) return {};
+  const sheets = getSheetsClient();
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:E`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+
+  const rows = res.data.values || [];
+  const priceMap = {};
+
+  for (const row of rows) {
+    const sym = row[0];
+    if (!symbols.includes(sym)) continue;
+    priceMap[sym] = {
+      current: parseFloat(row[1]) || null,
+      p1y:     parseFloat(row[2]) || null,
+      p3y:     parseFloat(row[3]) || null,
+      p5y:     parseFloat(row[4]) || null,
+    };
+  }
+  return priceMap;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,9 +212,9 @@ async function collectUniqueSymbols() {
   ]);
 
   return {
-    stocks: stocksRes.rows,                          // [{ tradingsymbol, exchange }]
-    mfs:    mfsRes.rows.map((r) => r.isin),          // [isin_string]
-    metals: metalsRes.rows.map((r) => r.metal_type), // [metal_type_string]
+    stocks: stocksRes.rows,
+    mfs:    mfsRes.rows.map((r) => r.isin),
+    metals: metalsRes.rows.map((r) => r.metal_type),
   };
 }
 
@@ -137,175 +222,91 @@ async function collectUniqueSymbols() {
 // Stock CAGR
 // ---------------------------------------------------------------------------
 
-function classifyMarketCap(marketCapUsd) {
-  if (!marketCapUsd) return { category: "SMALL_CAP", cap: CAPS.SMALL_CAP };
-  if (marketCapUsd >= LARGE_CAP_USD) return { category: "LARGE_CAP", cap: CAPS.LARGE_CAP };
-  if (marketCapUsd >= MID_CAP_USD)   return { category: "MID_CAP",   cap: CAPS.MID_CAP   };
-  return { category: "SMALL_CAP", cap: CAPS.SMALL_CAP };
-}
-
 async function processStocks(stocks) {
   const rows = [];
-  const today       = new Date();
-  const fiveYrsAgo  = new Date(today); fiveYrsAgo.setFullYear(today.getFullYear() - 5);
-  const oneYrAgo    = new Date(today); oneYrAgo.setFullYear(today.getFullYear() - 1);
-  const threeYrsAgo = new Date(today); threeYrsAgo.setFullYear(today.getFullYear() - 3);
+  if (!SHEET_ID) {
+    console.error("[CAGR/Stock] GOOGLE_SHEET_ID not set — skipping stocks");
+    return rows;
+  }
+  if (stocks.length === 0) return rows;
 
-  // SGBs (exchange 'GB') can't be looked up on Yahoo Finance — use GOLDBEES.NS + 2.5% SGB bonus
-  const isSgbStock  = (s) => s.exchange === "GB" || s.tradingsymbol.toUpperCase().startsWith("SGB");
+  const isSgbStock    = (s) => s.exchange === "GB" || s.tradingsymbol.toUpperCase().startsWith("SGB");
   const sgbStocks     = stocks.filter(isSgbStock);
   const regularStocks = stocks.filter((s) => !isSgbStock(s));
 
-  // --- SGB stocks ---
-  if (sgbStocks.length > 0) {
-    let goldHistory = null;
-    try {
-      const hist = await yf.historical("GOLDBEES.NS", {
-        period1: fiveYrsAgo, period2: today, interval: "1mo",
-      }, { validateResult: false });
-      goldHistory = [...hist].sort((a, b) => new Date(a.date) - new Date(b.date));
-      console.log(`[CAGR/Stock-SGB] GOLDBEES.NS — ${goldHistory.length} monthly rows`);
-      await sleep(RATE_LIMIT_MS);
-    } catch (err) {
-      console.error(`[CAGR/Stock-SGB] Failed to fetch GOLDBEES.NS: ${err.message}`);
+  // Build the full symbol list needed in the sheet
+  const regularSymbols = regularStocks.map((s) => `NSE:${s.tradingsymbol}`);
+  const allSymbols = [...regularSymbols];
+  if (sgbStocks.length > 0) allSymbols.push("NSE:GOLDBEES");
+
+  await syncSheetSymbols(allSymbols);
+  const priceMap = await readSheetPrices(allSymbols);
+
+  // --- SGB stocks (GOLDBEES prices + 2.5% annual interest bonus) ---
+  const goldPrices = priceMap["NSE:GOLDBEES"];
+  for (const { tradingsymbol, exchange } of sgbStocks) {
+    if (!goldPrices?.current) {
+      console.warn(`[CAGR/Stock-SGB] Skipped ${tradingsymbol}: GOLDBEES price unavailable`);
+      continue;
     }
-
-    for (const { tradingsymbol, exchange } of sgbStocks) {
-      if (!goldHistory) {
-        console.warn(`[CAGR/Stock-SGB] Skipped ${tradingsymbol}: GOLDBEES.NS unavailable`);
-        continue;
-      }
-      const availYrs   = availableYears(goldHistory);
-      const latestP    = goldHistory.at(-1)?.close ?? goldHistory.at(-1)?.adjclose;
-      const SGB_BONUS  = 0.025;
-
-      let cagr1y, cagr3y, cagr5y;
-
-      cagr1y = availYrs >= 1
-        ? (computeCagr(findClosestPrice(goldHistory, oneYrAgo), latestP, 1) ?? BENCHMARKS.metal) + SGB_BONUS
-        : BENCHMARKS.metal + SGB_BONUS;
-
-      if (availYrs >= 3) {
-        cagr3y = (computeCagr(findClosestPrice(goldHistory, threeYrsAgo), latestP, 3) ?? BENCHMARKS.metal) + SGB_BONUS;
-      } else if (availYrs >= 1) {
-        const raw = (computeCagr(findClosestPrice(goldHistory, oneYrAgo), latestP, Math.max(availYrs, 1)) ?? BENCHMARKS.metal) + SGB_BONUS;
-        cagr3y = blendWithBenchmark(raw - SGB_BONUS, availYrs, 3, BENCHMARKS.metal) + SGB_BONUS;
-      } else {
-        cagr3y = BENCHMARKS.metal + SGB_BONUS;
-      }
-
-      if (availYrs >= 5) {
-        cagr5y = (computeCagr(findClosestPrice(goldHistory, fiveYrsAgo), latestP, 5) ?? BENCHMARKS.metal) + SGB_BONUS;
-      } else if (availYrs >= 1) {
-        const raw = (computeCagr(findClosestPrice(goldHistory, fiveYrsAgo), latestP, Math.max(availYrs, 1)) ?? BENCHMARKS.metal) + SGB_BONUS;
-        cagr5y = blendWithBenchmark(raw - SGB_BONUS, availYrs, 5, BENCHMARKS.metal) + SGB_BONUS;
-      } else {
-        cagr5y = BENCHMARKS.metal + SGB_BONUS;
-      }
-
-      cagr1y = applyFloorAndCap(cagr1y, CAPS.sgb);
-      cagr3y = applyFloorAndCap(cagr3y, CAPS.sgb);
-      cagr5y = applyFloorAndCap(cagr5y, CAPS.sgb);
-
-      const mults = computeMultipliers(cagr1y, cagr3y, cagr5y);
-      rows.push({
-        symbol: tradingsymbol, asset_type: "stock", exchange, isin: null,
-        scheme_code: null, category: "sgb",
-        cagr_1y: parseFloat(cagr1y.toFixed(4)),
-        cagr_3y: parseFloat(cagr3y.toFixed(4)),
-        cagr_5y: parseFloat(cagr5y.toFixed(4)),
-        ...mults, cagr_source: "yahoo-finance2/GOLDBEES.NS+2.5%",
-      });
-      console.log(
-        `[CAGR/Stock-SGB] ${tradingsymbol} (+2.5%) | ` +
-        `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
-      );
-    }
+    const SGB_BONUS = 0.025;
+    let cagr1y = (computeCagr(goldPrices.p1y, goldPrices.current, 1) ?? BENCHMARKS.metal) + SGB_BONUS;
+    let cagr3y = (computeCagr(goldPrices.p3y, goldPrices.current, 3) ?? blendWithBenchmark(cagr1y - SGB_BONUS, 1, 3, BENCHMARKS.metal)) + SGB_BONUS;
+    let cagr5y = (computeCagr(goldPrices.p5y, goldPrices.current, 5) ?? blendWithBenchmark(cagr1y - SGB_BONUS, 1, 5, BENCHMARKS.metal)) + SGB_BONUS;
+    cagr1y = applyFloorAndCap(cagr1y, CAPS.sgb);
+    cagr3y = applyFloorAndCap(cagr3y, CAPS.sgb);
+    cagr5y = applyFloorAndCap(cagr5y, CAPS.sgb);
+    rows.push({
+      symbol: tradingsymbol, asset_type: "stock", exchange, isin: null,
+      scheme_code: null, category: "sgb",
+      cagr_1y: parseFloat(cagr1y.toFixed(4)),
+      cagr_3y: parseFloat(cagr3y.toFixed(4)),
+      cagr_5y: parseFloat(cagr5y.toFixed(4)),
+      ...computeMultipliers(cagr1y, cagr3y, cagr5y),
+      cagr_source: "google-sheets/GOOGLEFINANCE+2.5%",
+    });
+    console.log(
+      `[CAGR/Stock-SGB] ${tradingsymbol} (+2.5%) | ` +
+      `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
+    );
   }
 
   // --- Regular stocks ---
   for (const { tradingsymbol, exchange } of regularStocks) {
-    const ticker = `${tradingsymbol}.NS`;
-
-    try {
-      // Fetch quote (for market cap) and 5-year monthly history in parallel
-      const [quote, history] = await Promise.all([
-        yf.quote(ticker, {}, { validateResult: false }),
-        yf.historical(ticker, { period1: fiveYrsAgo, period2: today, interval: "1mo" }),
-      ]);
-
-      // Sort oldest→newest
-      const sorted = [...history].sort((a, b) => new Date(a.date) - new Date(b.date));
-
-      const { category, cap } = classifyMarketCap(quote?.marketCap);
-      const availYears = availableYears(sorted);
-      const latestPrice = sorted.at(-1)?.close ?? sorted.at(-1)?.adjclose;
-
-      // 1-year CAGR
-      let cagr1y;
-      if (availYears >= 1) {
-        const p1 = findClosestPrice(sorted, oneYrAgo);
-        cagr1y = computeCagr(p1, latestPrice, 1) ?? BENCHMARKS.stock;
-      } else {
-        cagr1y = BENCHMARKS.stock;
-      }
-
-      // 3-year CAGR
-      let cagr3y;
-      if (availYears >= 3) {
-        const p3 = findClosestPrice(sorted, threeYrsAgo);
-        cagr3y = computeCagr(p3, latestPrice, 3) ?? BENCHMARKS.stock;
-      } else if (availYears >= 1) {
-        const p1 = findClosestPrice(sorted, oneYrAgo);
-        const raw = computeCagr(p1, latestPrice, availYears < 1 ? 1 : availYears) ?? BENCHMARKS.stock;
-        cagr3y = blendWithBenchmark(raw, availYears, 3, BENCHMARKS.stock);
-      } else {
-        cagr3y = BENCHMARKS.stock;
-      }
-
-      // 5-year CAGR
-      let cagr5y;
-      if (availYears >= 5) {
-        const p5 = findClosestPrice(sorted, fiveYrsAgo);
-        cagr5y = computeCagr(p5, latestPrice, 5) ?? BENCHMARKS.stock;
-      } else if (availYears >= 1) {
-        const p = findClosestPrice(sorted, fiveYrsAgo);
-        const raw = computeCagr(p, latestPrice, availYears < 1 ? 1 : availYears) ?? BENCHMARKS.stock;
-        cagr5y = blendWithBenchmark(raw, availYears, 5, BENCHMARKS.stock);
-      } else {
-        cagr5y = BENCHMARKS.stock;
-      }
-
-      // Apply floor + ceiling
-      cagr1y = applyFloorAndCap(cagr1y, cap);
-      cagr3y = applyFloorAndCap(cagr3y, cap);
-      cagr5y = applyFloorAndCap(cagr5y, cap);
-
-      const mults = computeMultipliers(cagr1y, cagr3y, cagr5y);
-
-      rows.push({
-        symbol:       tradingsymbol,
-        asset_type:   "stock",
-        exchange,
-        isin:         null,
-        scheme_code:  null,
-        category,
-        cagr_1y:      parseFloat(cagr1y.toFixed(4)),
-        cagr_3y:      parseFloat(cagr3y.toFixed(4)),
-        cagr_5y:      parseFloat(cagr5y.toFixed(4)),
-        ...mults,
-        cagr_source:  "yahoo-finance2",
-      });
-
-      console.log(
-        `[CAGR/Stock] ${ticker} — ${category} | ` +
-        `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
-      );
-    } catch (err) {
-      console.error(`[CAGR/Stock] Skipped ${ticker}: ${err.message}`);
+    const sym    = `NSE:${tradingsymbol}`;
+    const prices = priceMap[sym];
+    if (!prices?.current) {
+      console.warn(`[CAGR/Stock] Skipped ${sym}: no price data in sheet`);
+      continue;
     }
 
-    await sleep(RATE_LIMIT_MS);
+    const { category, cap } = classifyBySymbol(tradingsymbol);
+
+    let cagr1y = computeCagr(prices.p1y, prices.current, 1) ?? BENCHMARKS.stock;
+    let cagr3y = prices.p3y
+      ? (computeCagr(prices.p3y, prices.current, 3) ?? blendWithBenchmark(cagr1y, 1, 3, BENCHMARKS.stock))
+      : blendWithBenchmark(cagr1y, 1, 3, BENCHMARKS.stock);
+    let cagr5y = prices.p5y
+      ? (computeCagr(prices.p5y, prices.current, 5) ?? blendWithBenchmark(cagr1y, 1, 5, BENCHMARKS.stock))
+      : blendWithBenchmark(cagr1y, 1, 5, BENCHMARKS.stock);
+
+    cagr1y = applyFloorAndCap(cagr1y, cap);
+    cagr3y = applyFloorAndCap(cagr3y, cap);
+    cagr5y = applyFloorAndCap(cagr5y, cap);
+
+    rows.push({
+      symbol: tradingsymbol, asset_type: "stock", exchange, isin: null,
+      scheme_code: null, category,
+      cagr_1y: parseFloat(cagr1y.toFixed(4)),
+      cagr_3y: parseFloat(cagr3y.toFixed(4)),
+      cagr_5y: parseFloat(cagr5y.toFixed(4)),
+      ...computeMultipliers(cagr1y, cagr3y, cagr5y),
+      cagr_source: "google-sheets/GOOGLEFINANCE",
+    });
+    console.log(
+      `[CAGR/Stock] ${sym} — ${category} | ` +
+      `1y:${(cagr1y * 100).toFixed(1)}% 3y:${(cagr3y * 100).toFixed(1)}% 5y:${(cagr5y * 100).toFixed(1)}%`
+    );
   }
 
   return rows;
@@ -452,93 +453,46 @@ async function processMFs(isins) {
 }
 
 // ---------------------------------------------------------------------------
-// Metal CAGR
+// Metal CAGR  (uses GOLDBEES from the same Google Sheet)
 // ---------------------------------------------------------------------------
 
 async function processMetals(metalTypes) {
   const rows = [];
+  if (!SHEET_ID) {
+    console.error("[CAGR/Metal] GOOGLE_SHEET_ID not set — skipping metals");
+    return rows;
+  }
 
-  // Filter to only known metal types
-  const known = metalTypes.filter((mt) => METAL_TICKERS[mt]);
-  const unknown = metalTypes.filter((mt) => !METAL_TICKERS[mt]);
+  const KNOWN_METAL_TYPES = new Set(["physical_gold", "digital_gold", "sgb"]);
+  const known   = metalTypes.filter((mt) => KNOWN_METAL_TYPES.has(mt));
+  const unknown = metalTypes.filter((mt) => !KNOWN_METAL_TYPES.has(mt));
   if (unknown.length > 0) {
     console.warn(`[CAGR/Metal] Unknown metal types (skipped): ${unknown.join(", ")}`);
   }
   if (known.length === 0) return rows;
 
-  const today      = new Date();
-  const fiveYrsAgo = new Date(today); fiveYrsAgo.setFullYear(today.getFullYear() - 5);
-  const oneYrAgo   = new Date(today); oneYrAgo.setFullYear(today.getFullYear() - 1);
-  const threeYrsAgo = new Date(today); threeYrsAgo.setFullYear(today.getFullYear() - 3);
+  await syncSheetSymbols(["NSE:GOLDBEES"]);
+  const priceMap = await readSheetPrices(["NSE:GOLDBEES"]);
+  const goldPrices = priceMap["NSE:GOLDBEES"];
 
-  // All gold variants share GOLDBEES.NS — fetch once
-  let goldHistory = null;
-  let goldFetchErr = null;
-  if (known.some((mt) => METAL_TICKERS[mt] === "GOLDBEES.NS")) {
-    try {
-      const hist = await yf.historical("GOLDBEES.NS", {
-        period1:  fiveYrsAgo,
-        period2:  today,
-        interval: "1mo",
-      }, { validateResult: false });
-      goldHistory = [...hist].sort((a, b) => new Date(a.date) - new Date(b.date));
-      console.log(`[CAGR/Metal] GOLDBEES.NS history — ${goldHistory.length} monthly rows`);
-      await sleep(RATE_LIMIT_MS);
-    } catch (err) {
-      goldFetchErr = err.message;
-      console.error(`[CAGR/Metal] Failed to fetch GOLDBEES.NS: ${err.message}`);
-    }
+  if (!goldPrices?.current) {
+    console.error("[CAGR/Metal] GOLDBEES price unavailable — skipping all metals");
+    return rows;
   }
 
+  console.log(
+    `[CAGR/Metal] GOLDBEES prices — current:${goldPrices.current} ` +
+    `1y:${goldPrices.p1y} 3y:${goldPrices.p3y} 5y:${goldPrices.p5y}`
+  );
+
   for (const metalType of known) {
-    const ticker = METAL_TICKERS[metalType];
-    const isSgb  = metalType === "sgb";
-    const sorted = ticker === "GOLDBEES.NS" ? goldHistory : null;
+    const isSgb    = metalType === "sgb";
+    const cap      = isSgb ? CAPS.sgb : CAPS.metal;
+    const sgbBonus = isSgb ? 0.025 : 0;
 
-    if (!sorted) {
-      console.error(`[CAGR/Metal] No history for ${metalType} (${ticker}${goldFetchErr ? ": " + goldFetchErr : ""}) — skipping`);
-      continue;
-    }
-
-    const availYears   = availableYears(sorted);
-    const latestPrice  = sorted.at(-1)?.close ?? sorted.at(-1)?.adjclose;
-    const cap          = isSgb ? CAPS.sgb : CAPS.metal;
-    const sgbBonus     = isSgb ? 0.025 : 0;
-
-    // 1-year CAGR
-    let cagr1y;
-    if (availYears >= 1) {
-      const p = findClosestPrice(sorted, oneYrAgo);
-      cagr1y = (computeCagr(p, latestPrice, 1) ?? BENCHMARKS.metal) + sgbBonus;
-    } else {
-      cagr1y = BENCHMARKS.metal + sgbBonus;
-    }
-
-    // 3-year CAGR
-    let cagr3y;
-    if (availYears >= 3) {
-      const p = findClosestPrice(sorted, threeYrsAgo);
-      cagr3y = (computeCagr(p, latestPrice, 3) ?? BENCHMARKS.metal) + sgbBonus;
-    } else if (availYears >= 1) {
-      const p = findClosestPrice(sorted, oneYrAgo);
-      const raw = (computeCagr(p, latestPrice, Math.max(availYears, 1)) ?? BENCHMARKS.metal) + sgbBonus;
-      cagr3y = blendWithBenchmark(raw - sgbBonus, availYears, 3, BENCHMARKS.metal) + sgbBonus;
-    } else {
-      cagr3y = BENCHMARKS.metal + sgbBonus;
-    }
-
-    // 5-year CAGR
-    let cagr5y;
-    if (availYears >= 5) {
-      const p = findClosestPrice(sorted, fiveYrsAgo);
-      cagr5y = (computeCagr(p, latestPrice, 5) ?? BENCHMARKS.metal) + sgbBonus;
-    } else if (availYears >= 1) {
-      const p = findClosestPrice(sorted, fiveYrsAgo);
-      const raw = (computeCagr(p, latestPrice, Math.max(availYears, 1)) ?? BENCHMARKS.metal) + sgbBonus;
-      cagr5y = blendWithBenchmark(raw - sgbBonus, availYears, 5, BENCHMARKS.metal) + sgbBonus;
-    } else {
-      cagr5y = BENCHMARKS.metal + sgbBonus;
-    }
+    let cagr1y = (computeCagr(goldPrices.p1y, goldPrices.current, 1) ?? BENCHMARKS.metal) + sgbBonus;
+    let cagr3y = (computeCagr(goldPrices.p3y, goldPrices.current, 3) ?? blendWithBenchmark(cagr1y - sgbBonus, 1, 3, BENCHMARKS.metal)) + sgbBonus;
+    let cagr5y = (computeCagr(goldPrices.p5y, goldPrices.current, 5) ?? blendWithBenchmark(cagr1y - sgbBonus, 1, 5, BENCHMARKS.metal)) + sgbBonus;
 
     cagr1y = applyFloorAndCap(cagr1y, cap);
     cagr3y = applyFloorAndCap(cagr3y, cap);
@@ -557,7 +511,7 @@ async function processMetals(metalTypes) {
       cagr_3y:     parseFloat(cagr3y.toFixed(4)),
       cagr_5y:     parseFloat(cagr5y.toFixed(4)),
       ...mults,
-      cagr_source: "yahoo-finance2/GOLDBEES.NS",
+      cagr_source: "google-sheets/GOOGLEFINANCE" + (isSgb ? "+2.5%" : ""),
     });
 
     console.log(
@@ -625,10 +579,9 @@ async function runCagrJob() {
     `[CAGR] Symbols collected — stocks:${stocks.length}, mfs:${mfs.length}, metals:${metals.length}`
   );
 
-  // Sequential processing to respect API rate limits
-  const stockRows  = await processStocks(stocks);
-  const mfRows     = await processMFs(mfs);
-  const metalRows  = await processMetals(metals);
+  const stockRows = await processStocks(stocks);
+  const mfRows    = await processMFs(mfs);
+  const metalRows = await processMetals(metals);
 
   const allRows = [...stockRows, ...mfRows, ...metalRows];
   await upsertCagrRows(allRows);
@@ -657,7 +610,6 @@ async function runCagrJob() {
  * Call this once from index.js after app.listen().
  */
 function initCagrScheduler() {
-  // Sunday 11 PM IST = Sunday 17:30 UTC
   cron.schedule("30 17 * * 0", async () => {
     console.log("[CAGR] Weekly cron triggered");
     try {
@@ -675,40 +627,51 @@ function initCagrScheduler() {
 // ---------------------------------------------------------------------------
 
 /**
- * Recomputes and upserts CAGR for all provided stocks.
- * Always overwrites existing rows — no "missing only" logic.
- * Safe to fire-and-forget.
+ * Recomputes CAGR only for stocks whose data is older than 7 days.
+ * Safe to fire-and-forget. Scales to any number of users.
  * @param {Array<{tradingsymbol: string, exchange: string}>} stocks
  */
 async function recomputeStocksCagr(stocks) {
   if (!stocks || stocks.length === 0) return;
 
-  console.log(
-    `[CAGR/Sync] Recomputing CAGR for ${stocks.length} stock(s): ` +
-    stocks.map((s) => s.tradingsymbol).join(", ")
+  // Only process symbols with stale (>7 days) or missing CAGR
+  const staleResult = await pool.query(
+    `SELECT s.tradingsymbol, s.exchange
+     FROM unnest($1::text[], $2::text[]) AS s(tradingsymbol, exchange)
+     LEFT JOIN asset_cagr ac ON ac.symbol = s.tradingsymbol AND ac.asset_type = 'stock'
+     WHERE ac.last_updated_at IS NULL OR ac.last_updated_at < NOW() - INTERVAL '7 days'`,
+    [stocks.map((s) => s.tradingsymbol), stocks.map((s) => s.exchange)]
   );
 
-  const rows = await processStocks(stocks);
+  const stale = staleResult.rows;
+  if (stale.length === 0) {
+    console.log("[CAGR/Sync] All stocks fresh (< 7 days) — skipping");
+    return;
+  }
+
+  console.log(
+    `[CAGR/Sync] Recomputing CAGR for ${stale.length} stale stock(s): ` +
+    stale.map((s) => s.tradingsymbol).join(", ")
+  );
+
+  const rows = await processStocks(stale);
   if (rows.length > 0) await upsertCagrRows(rows);
 
   console.log(`[CAGR/Sync] Done — updated CAGR for ${rows.length} stock(s)`);
 }
 
 // ---------------------------------------------------------------------------
-// On-demand CAGR recompute for metals (called from sync-cagr endpoint)
+// On-demand CAGR recompute for metals
 // ---------------------------------------------------------------------------
 
 /**
  * Recomputes and upserts CAGR for all provided metal types.
- * Always overwrites existing rows — no "missing only" logic.
  * @param {string[]} metalTypes  e.g. ["physical_gold", "digital_gold"]
  */
 async function recomputeMetalsCagr(metalTypes) {
   if (!metalTypes || metalTypes.length === 0) return;
 
-  console.log(
-    `[CAGR/Sync] Recomputing CAGR for metals: ${metalTypes.join(", ")}`
-  );
+  console.log(`[CAGR/Sync] Recomputing CAGR for metals: ${metalTypes.join(", ")}`);
 
   const rows = await processMetals(metalTypes);
   if (rows.length > 0) await upsertCagrRows(rows);
@@ -717,20 +680,17 @@ async function recomputeMetalsCagr(metalTypes) {
 }
 
 // ---------------------------------------------------------------------------
-// On-demand CAGR recompute for mutual funds (called from sync-cagr endpoint)
+// On-demand CAGR recompute for mutual funds
 // ---------------------------------------------------------------------------
 
 /**
  * Recomputes and upserts CAGR for all provided ISINs.
- * Always overwrites existing rows.
  * @param {string[]} isins  e.g. ["INF109K01AN1", "INF204K01AT7"]
  */
 async function recomputeMfCagr(isins) {
   if (!isins || isins.length === 0) return;
 
-  console.log(
-    `[CAGR/Sync] Recomputing CAGR for ${isins.length} MF ISIN(s): ${isins.join(", ")}`
-  );
+  console.log(`[CAGR/Sync] Recomputing CAGR for ${isins.length} MF ISIN(s): ${isins.join(", ")}`);
 
   const rows = await processMFs(isins);
   if (rows.length > 0) await upsertCagrRows(rows);
