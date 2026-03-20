@@ -243,12 +243,16 @@ const parseCasPdf = async (req, res) => {
 };
 
 async function extractFundsFromCas(text) {
-  // KFINTECH CAS PDFs extract in a non-obvious order:
-  // - Each ISIN line appears one line BEFORE its "Folio No :" marker
-  // - Transactions are multi-line: date alone, type, amount, then units+nav concatenated
-  // - Page-2 content can interleave transactions from different funds
-  // Strategy: find all ISINs in order, find all closing balances in order,
-  // match by position, then assign transactions by line range.
+  // KFINTECH CAS PDF structure (multi-page):
+  // - ISINs for page-2+ funds appear in a summary section AFTER their transaction blocks
+  // - Closing balances are inline with transactions
+  // - Opening balances exist for holdings pre-dating the statement period
+  //
+  // Strategy:
+  //   1. Parse all ISINs + closing balances in document order, match by index position
+  //   2. Each fund gets ONE summary lot using closing_units + Total Cost Value from CAS
+  //      (avoids all issues with opening balances, partial redemptions, and multi-lot tracking)
+  //   3. For purchase_date, use the earliest transaction date found in the fund's line range
 
   const lines = text.split("\n").map((l) => l.trim());
 
@@ -259,15 +263,12 @@ async function extractFundsFromCas(text) {
     if (!isinMatch) continue;
     const isin = isinMatch[1];
 
-    // Scheme name = everything before " - ISIN" on this line
     const schemeName = lines[i].split(/\s*-\s*ISIN/i)[0].trim() || isin;
 
-    // Folio number: on same or next line
     const folioSrc = lines[i] + " " + (lines[i + 1] || "");
     const fm = folioSrc.match(/Folio No\s*:\s*(\S+)/i);
     const folioNumber = fm ? fm[1] : "UNKNOWN";
 
-    // AMC: scan backwards, skip Nominee / portfolio header lines
     let amcName = null;
     for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
       const l = lines[j];
@@ -284,7 +285,6 @@ async function extractFundsFromCas(text) {
   for (let i = 0; i < lines.length; i++) {
     const cb = lines[i].match(/Closing Unit Balance:\s*([\d,]+\.?\d*)/i);
     if (!cb) continue;
-    // Total Cost Value is typically on the next line in KFINTECH CAS
     const combined = lines[i] + " " + (lines[i + 1] || "");
     const cv = combined.match(/Total Cost Value\s*:\s*INR\s*([\d,]+\.?\d*)/i);
     closingBalances.push({
@@ -298,57 +298,59 @@ async function extractFundsFromCas(text) {
     console.warn(`[CAS] Fund/balance count mismatch: ${fundDecls.length} ISINs, ${closingBalances.length} closing balances`);
   }
 
-  // --- Step 3: All purchase transactions
-  // Multi-line format in extracted text:
-  //   line i  : DD-MMM-YYYY          (date alone)
-  //   line i+1: Purchase[+ TrxnRef]  (type, possibly with reference suffix)
-  //   line i+2: 19,999.00            (amount)
-  //   line i+3: 423.10747.267        (units + nav concatenated — units always 3 dp)
-  const allTxns = [];
-  for (let i = 0; i < lines.length - 3; i++) {
-    if (!/^\d{2}-[A-Z]{3}-\d{4}$/.test(lines[i])) continue;
-    const typeLine = lines[i + 1] || "";
-    if (!/^(Purchase|Additional\s+Purchase|SIP)/i.test(typeLine)) continue;
+  // --- Step 3: Assemble funds — one summary lot per fund from closing balance
+  //
+  // Using closing balance data (units + Total Cost Value) as the authoritative lot avoids:
+  //   - Opening balance units (pre-statement history not shown as transactions)
+  //   - Partial redemptions changing which specific lots remain
+  //   - Multi-page KFINTECH layout where page-2 ISINs appear after their transaction blocks
+  //
+  // purchase_date = earliest transaction date in this fund's line range (or statement date)
+  // purchase_nav  = Total Cost Value / closing_units  (average cost basis)
 
-    const amount = parseNum((lines[i + 2] || "").replace(/,/g, ""));
-    if (isNaN(amount) || amount <= 0) continue;
-
-    // Split concatenated units+nav: units have exactly 3 decimal places
-    const unitsNavStr = (lines[i + 3] || "").replace(/,/g, "");
-    const unm = unitsNavStr.match(/^(\d+\.\d{3})(\d+\.\d+)$/);
-    if (!unm) continue;
-
-    const units = parseFloat(unm[1]);
-    const nav   = parseFloat(unm[2]);
-    if (isNaN(units) || units <= 0 || isNaN(nav)) continue;
-
-    allTxns.push({ date: parseIndianDate(lines[i]), amount, units, nav, lineIdx: i });
+  // Collect all date lines for purchase_date heuristic
+  const allDateLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\d{2}-[A-Z]{3}-\d{4}$/.test(lines[i])) {
+      allDateLines.push({ date: parseIndianDate(lines[i]), lineIdx: i });
+    }
   }
 
-  // --- Step 4: Assemble funds by matching decls→balances by index order
-  //             and filtering transactions into each fund's line range
+  // Parse statement date as fallback (format: "10-Mar-2026 To 10-Mar-2026")
+  let statementDate = null;
+  for (const line of lines) {
+    const sm = line.match(/(\d{1,2}-[A-Za-z]{3}-\d{4})\s+To\s+\d{1,2}-[A-Za-z]{3}-\d{4}/);
+    if (sm) { statementDate = parseIndianDate(sm[1].toUpperCase()); break; }
+  }
+
   const funds = [];
   for (let i = 0; i < fundDecls.length; i++) {
     const decl = fundDecls[i];
     const cb   = closingBalances[i];
     if (!cb) continue;
 
+    // Find earliest transaction date in this fund's line range
     const startLine = i === 0 ? 0 : closingBalances[i - 1].lineIdx;
     const endLine   = cb.lineIdx;
+    const datesInRange = allDateLines.filter((d) => d.lineIdx > startLine && d.lineIdx < endLine);
+    const purchaseDate = datesInRange.length > 0
+      ? datesInRange.reduce((min, d) => d.date < min ? d.date : min, datesInRange[0].date)
+      : (statementDate || new Date().toISOString().slice(0, 10));
 
-    const lots = allTxns.filter((t) => t.lineIdx > startLine && t.lineIdx < endLine);
+    const avgNav         = cb.units > 0 ? parseFloat((cb.costValue / cb.units).toFixed(4)) : 0;
+    const summaryLot     = { date: purchaseDate, units: cb.units, nav: avgNav, amount: cb.costValue };
 
     funds.push({
       isin:             decl.isin,
-      scheme_code:      null, // resolved below
+      scheme_code:      null,
       scheme_name:      decl.schemeName,
       amc_name:         decl.amcName,
       folio_number:     decl.folioNumber,
       closing_units:    cb.units,
       nav_at_statement: 0,
-      amount_invested:  cb.costValue || lots.reduce((s, l) => s + l.amount, 0),
+      amount_invested:  cb.costValue,
       lookup_failed:    false,
-      lots,
+      lots:             [summaryLot],
     });
   }
 
@@ -427,7 +429,18 @@ const confirmCasImport = async (req, res) => {
     for (const fund of funds) {
       if (!fund.isin) continue;
 
-      const nav           = await getNavForScheme(fund.scheme_code);
+      // If scheme_code wasn't resolved during preview (mfapi.in was flaky), retry now
+      let schemeCode = fund.scheme_code ?? null;
+      if (!schemeCode) {
+        try {
+          const query = cleanSchemeNameForSearch(fund.scheme_name || fund.isin);
+          const r = await axios.get(`${MFAPI_BASE}/search?q=${encodeURIComponent(query)}`, { timeout: 8000 });
+          const results = Array.isArray(r.data) ? r.data : [];
+          if (results.length > 0) schemeCode = String(pickBestScheme(results, fund.scheme_name || "").schemeCode);
+        } catch { /* proceed without */ }
+      }
+
+      const nav           = await getNavForScheme(schemeCode);
       const latestNav     = nav?.latest_nav ?? null;
       const latestNavDate = nav?.nav_date   ?? null;
 
@@ -453,7 +466,7 @@ const confirmCasImport = async (req, res) => {
               import_source)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'cas_pdf')`,
           [
-            req.user_id, fund.isin, fund.scheme_code, fund.scheme_name,
+            req.user_id, fund.isin, schemeCode, fund.scheme_name,
             fund.folio_number ?? "UNKNOWN", fund.amc_name ?? null,
             units, purchaseNav, purchaseDate, amountInvested,
             latestNav, latestNavDate, currentValue, absoluteReturn, absoluteReturnPct,
