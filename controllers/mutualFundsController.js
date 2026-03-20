@@ -802,13 +802,6 @@ const syncNav = async (req, res) => {
       return success(res, { message: "No MF holdings found", updated: 0 });
     }
 
-    // Ensure close_nav and day_pnl columns exist (idempotent one-time migration)
-    await pool.query(`
-      ALTER TABLE mutual_fund_holdings
-        ADD COLUMN IF NOT EXISTS close_nav NUMERIC,
-        ADD COLUMN IF NOT EXISTS day_pnl   NUMERIC DEFAULT 0
-    `);
-
     // Fetch all NAVs in a single AMFI pass
     const amfiMap = await lookupIsinsFromAmfi(isins);
 
