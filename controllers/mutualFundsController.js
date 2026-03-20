@@ -5,6 +5,43 @@ const { success, fail }     = require("../utils/respond");
 const { recomputeMfCagr }   = require("../services/cagrCalculator");
 
 const MFAPI_BASE = "https://api.mfapi.in/mf";
+const AMFI_NAV_URL = "https://www.amfiindia.com/spages/NAVAll.txt";
+
+/**
+ * Fetch AMFI NAV file once and resolve multiple ISINs in a single pass.
+ * Returns { [isin]: { scheme_code, latest_nav, nav_date, scheme_name } }
+ * Falls back to empty object on any error (never throws).
+ */
+async function lookupIsinsFromAmfi(isins) {
+  if (!isins || isins.length === 0) return {};
+  try {
+    const r = await axios.get(AMFI_NAV_URL, { timeout: 15000, responseType: "text" });
+    const isinSet = new Set(isins.map((i) => i.trim().toUpperCase()));
+    const result  = {};
+    for (const line of r.data.split("\n")) {
+      const parts = line.split(";");
+      if (parts.length < 6) continue;
+      const [schemeCode, isin1Raw, isin2Raw, schemeName, navStr, navDateRaw] = parts;
+      for (const raw of [isin1Raw, isin2Raw]) {
+        const isin = (raw || "").trim().toUpperCase();
+        if (isin && isinSet.has(isin) && !result[isin]) {
+          const latest_nav = parseFloat(navStr);
+          if (!isNaN(latest_nav)) {
+            result[isin] = {
+              scheme_code: schemeCode.trim(),
+              latest_nav,
+              nav_date:    parseIndianDate((navDateRaw || "").trim()),
+              scheme_name: schemeName.trim(),
+            };
+          }
+        }
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
 
 // ---------------------------------------------------------------------------
 // XIRR (Newton-Raphson)
@@ -355,41 +392,15 @@ async function extractFundsFromCas(text) {
   }
 
   // Resolve scheme_codes in parallel batches of 5.
-  // mfapi.in ?isin= is currently broken (HTTP 500), so fall back to ?q=scheme_name.
-  const isins = [...new Set(funds.map((f) => f.isin))];
-  const schemeMap = {};
-  const isinToName = Object.fromEntries(funds.map((f) => [f.isin, f.scheme_name]));
-
-  for (let i = 0; i < isins.length; i += 5) {
-    const batch = isins.slice(i, i + 5);
-    await Promise.all(
-      batch.map(async (isin) => {
-        // Try ?isin= first (fast, direct)
-        let results = [];
-        try {
-          const r = await axios.get(`${MFAPI_BASE}/search?isin=${encodeURIComponent(isin)}`, { timeout: 8000 });
-          if (Array.isArray(r.data) && r.data.length > 0) results = r.data;
-        } catch { /* fall through to name search */ }
-
-        // Fallback: ?q=scheme_name (more robust)
-        if (results.length === 0) {
-          try {
-            const query = cleanSchemeNameForSearch(isinToName[isin] || isin);
-            const r = await axios.get(`${MFAPI_BASE}/search?q=${encodeURIComponent(query)}`, { timeout: 8000 });
-            if (Array.isArray(r.data) && r.data.length > 0) results = r.data;
-          } catch { /* give up */ }
-        }
-
-        if (results.length > 0) {
-          schemeMap[isin] = String(pickBestScheme(results, isinToName[isin] || "").schemeCode);
-        }
-      })
-    );
-  }
+  // Resolve scheme_codes via AMFI NAV file (reliable, no IP restrictions).
+  // Fetches the full NAV list once and resolves all ISINs in a single pass.
+  const isins   = [...new Set(funds.map((f) => f.isin))];
+  const amfiMap = await lookupIsinsFromAmfi(isins);
 
   for (const fund of funds) {
-    if (schemeMap[fund.isin]) {
-      fund.scheme_code  = schemeMap[fund.isin];
+    const amfi = amfiMap[fund.isin];
+    if (amfi) {
+      fund.scheme_code   = amfi.scheme_code;
       fund.lookup_failed = false;
     } else {
       fund.lookup_failed = true;
@@ -426,20 +437,19 @@ const confirmCasImport = async (req, res) => {
     );
     deleted = delResult.rowCount ?? 0;
 
+    // Re-resolve any null scheme_codes via AMFI (handles mfapi.in being blocked on Render)
+    const nullIsinFunds = funds.filter((f) => f.isin && !f.scheme_code);
+    if (nullIsinFunds.length > 0) {
+      const amfiMap = await lookupIsinsFromAmfi(nullIsinFunds.map((f) => f.isin));
+      for (const fund of nullIsinFunds) {
+        if (amfiMap[fund.isin]) fund.scheme_code = amfiMap[fund.isin].scheme_code;
+      }
+    }
+
     for (const fund of funds) {
       if (!fund.isin) continue;
 
-      // If scheme_code wasn't resolved during preview (mfapi.in was flaky), retry now
-      let schemeCode = fund.scheme_code ?? null;
-      if (!schemeCode) {
-        try {
-          const query = cleanSchemeNameForSearch(fund.scheme_name || fund.isin);
-          const r = await axios.get(`${MFAPI_BASE}/search?q=${encodeURIComponent(query)}`, { timeout: 8000 });
-          const results = Array.isArray(r.data) ? r.data : [];
-          if (results.length > 0) schemeCode = String(pickBestScheme(results, fund.scheme_name || "").schemeCode);
-        } catch { /* proceed without */ }
-      }
-
+      const schemeCode = fund.scheme_code ?? null;
       const nav           = await getNavForScheme(schemeCode);
       const latestNav     = nav?.latest_nav ?? null;
       const latestNavDate = nav?.nav_date   ?? null;
