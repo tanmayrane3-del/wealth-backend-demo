@@ -30,6 +30,8 @@ const kiteRoutes = require("./routes/kite");
 const metalsRoutes       = require("./routes/metals");
 const cagrRoutes         = require("./routes/cagr");
 const mutualFundsRoutes  = require("./routes/mutualFunds");
+const physicalAssetsRoutes = require("./routes/physicalAssets");
+const liabilitiesRoutes    = require("./routes/liabilities");
 
 // Use routes
 app.use("/api/users", userRoutes);
@@ -49,7 +51,9 @@ app.use("/api/holdings", holdingsRoutes);
 app.use("/api/kite", kiteRoutes);
 app.use("/api/metals",       metalsRoutes);
 app.use("/api/cagr",         cagrRoutes);
-app.use("/api/mutual-funds", mutualFundsRoutes);
+app.use("/api/mutual-funds",    mutualFundsRoutes);
+app.use("/api/physical-assets", physicalAssetsRoutes);
+app.use("/api/liabilities",     liabilitiesRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
