@@ -32,6 +32,9 @@ const cagrRoutes         = require("./routes/cagr");
 const mutualFundsRoutes  = require("./routes/mutualFunds");
 const physicalAssetsRoutes = require("./routes/physicalAssets");
 const liabilitiesRoutes    = require("./routes/liabilities");
+const netWorthRoutes       = require("./routes/netWorth");
+const cron                 = require("node-cron");
+const { calculateCurrentNetWorth } = require("./controllers/netWorthController");
 
 // Use routes
 app.use("/api/users", userRoutes);
@@ -54,6 +57,7 @@ app.use("/api/cagr",         cagrRoutes);
 app.use("/api/mutual-funds",    mutualFundsRoutes);
 app.use("/api/physical-assets", physicalAssetsRoutes);
 app.use("/api/liabilities",     liabilitiesRoutes);
+app.use("/api/net-worth",       netWorthRoutes);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -70,6 +74,39 @@ app.listen(PORT, () => {
   // Weekly CAGR calculation job (every Sunday 23:00 IST)
   const { initCagrScheduler } = require("./services/cagrCalculator");
   initCagrScheduler();
+
+  // Daily net worth snapshot at 11:00 PM IST (17:30 UTC)
+  cron.schedule("30 17 * * *", async () => {
+    console.log("[net-worth cron] Running daily snapshot for all users...");
+    try {
+      const usersResult = await pool.query(
+        `SELECT user_id FROM users WHERE is_active = true`
+      );
+      let count = 0;
+      for (const row of usersResult.rows) {
+        try {
+          const { totalAssets, totalLiabilities, netWorth } =
+            await calculateCurrentNetWorth(row.user_id);
+          await pool.query(
+            `INSERT INTO net_worth_snapshots
+               (user_id, snapshot_date, total_assets, total_liabilities, net_worth)
+             VALUES ($1, CURRENT_DATE, $2, $3, $4)
+             ON CONFLICT (user_id, snapshot_date) DO UPDATE SET
+               total_assets      = EXCLUDED.total_assets,
+               total_liabilities = EXCLUDED.total_liabilities,
+               net_worth         = EXCLUDED.net_worth`,
+            [row.user_id, totalAssets, totalLiabilities, netWorth]
+          );
+          count++;
+        } catch (e) {
+          console.error(`[net-worth cron] Failed for user ${row.user_id}:`, e.message);
+        }
+      }
+      console.log(`[net-worth cron] Done — ${count} snapshot(s) written.`);
+    } catch (e) {
+      console.error("[net-worth cron] Fatal error:", e.message);
+    }
+  });
 
   // Self-ping every 14 minutes to prevent Render from sleeping
   const RENDER_URL = process.env.RENDER_URL;
