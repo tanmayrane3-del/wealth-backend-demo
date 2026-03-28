@@ -9,7 +9,7 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || "postgres",
   ssl: { rejectUnauthorized: false },
-  min: 0,
+  min: 1,
   max: 3,                        // stay within PgBouncer session-mode pool_size
   idleTimeoutMillis: 30000,      // release idle connections quickly to free PgBouncer slots
   connectionTimeoutMillis: 8000, // fail fast: 8s × 2 attempts = 16s max
