@@ -76,6 +76,134 @@ async function calculateCurrentNetWorth(userId) {
   return { totalAssets, totalLiabilities, netWorth };
 }
 
+// ─── Enrichment helper (day change + projections + counts) ─────────────────
+// Separated so that if any enrichment query fails, the base net worth still returns.
+async function computeEnrichment(userId, stocksValue, mfValue, metalsValue, physicalTotal) {
+  const [
+    stocksStats,
+    mfStats,
+    metalsStats,
+    otherCount,
+    goldDayPct,
+  ] = await Promise.all([
+    // ── Stocks: day change + projections + count ──────────────────────────
+    pool.query(
+      `SELECT
+         COALESCE(SUM(sh.day_change * sh.quantity), 0)::float8              AS day_change,
+         COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_1y, 1.0)), 0)::float8 AS proj_1y,
+         COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_3y, 1.0)), 0)::float8 AS proj_3y,
+         COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_5y, 1.0)), 0)::float8 AS proj_5y,
+         COUNT(DISTINCT sh.tradingsymbol)::int                              AS stocks_count
+       FROM stock_holdings sh
+       LEFT JOIN asset_cagr ac ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
+       WHERE sh.user_id = $1`,
+      [userId]
+    ),
+
+    // ── MF: day change + projections + count ──────────────────────────────
+    pool.query(
+      `SELECT
+         COALESCE(SUM(COALESCE(mfh.day_pnl, 0)), 0)::float8                           AS day_change,
+         COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_1y, 1.0)), 0)::float8 AS proj_1y,
+         COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_3y, 1.0)), 0)::float8 AS proj_3y,
+         COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_5y, 1.0)), 0)::float8 AS proj_5y,
+         COUNT(DISTINCT mfh.isin)::int                                                 AS mf_count
+       FROM mutual_fund_holdings mfh
+       LEFT JOIN asset_cagr ac ON ac.symbol = mfh.isin AND ac.asset_type = 'mf'
+       WHERE mfh.user_id = $1`,
+      [userId]
+    ),
+
+    // ── Metals: projections (day change derived from live rate %) ─────────
+    pool.query(
+      `SELECT
+         COALESCE(SUM(
+           mh.quantity_grams * CASE mh.purity
+             WHEN '24k' THEN mr.gold_24k_per_gram
+             WHEN '22k' THEN mr.gold_22k_per_gram
+             ELSE mr.silver_per_gram
+           END * COALESCE(ac.multiplier_1y, 1.0)
+         ), 0)::float8 AS proj_1y,
+         COALESCE(SUM(
+           mh.quantity_grams * CASE mh.purity
+             WHEN '24k' THEN mr.gold_24k_per_gram
+             WHEN '22k' THEN mr.gold_22k_per_gram
+             ELSE mr.silver_per_gram
+           END * COALESCE(ac.multiplier_3y, 1.0)
+         ), 0)::float8 AS proj_3y,
+         COALESCE(SUM(
+           mh.quantity_grams * CASE mh.purity
+             WHEN '24k' THEN mr.gold_24k_per_gram
+             WHEN '22k' THEN mr.gold_22k_per_gram
+             ELSE mr.silver_per_gram
+           END * COALESCE(ac.multiplier_5y, 1.0)
+         ), 0)::float8 AS proj_5y
+       FROM metal_holdings mh
+       CROSS JOIN (SELECT * FROM metal_rates_cache ORDER BY fetched_at DESC LIMIT 1) mr
+       LEFT JOIN asset_cagr ac ON ac.asset_type = 'metal' AND ac.symbol = mh.metal_type::text
+       WHERE mh.user_id = $1`,
+      [userId]
+    ),
+
+    // ── Other assets: count ───────────────────────────────────────────────
+    pool.query(
+      `SELECT COUNT(*)::int AS other_count
+       FROM physical_assets WHERE user_id = $1 AND is_active = true`,
+      [userId]
+    ),
+
+    // ── Gold daily change % (live scrape, graceful fallback) ──────────────
+    fetchGoldDayChangePct().catch(() => 0),
+  ]);
+
+  // ── Day changes ─────────────────────────────────────────────────────────
+  const metalsDayChange = goldDayPct !== 0
+    ? metalsValue - metalsValue / (1 + goldDayPct)
+    : 0;
+  const stocksDayChange = parseFloat(stocksStats.rows[0].day_change);
+  const mfDayChange     = parseFloat(mfStats.rows[0].day_change);
+  const totalDayChange  = stocksDayChange + metalsDayChange + mfDayChange;
+  const netWorth        = stocksValue + mfValue + metalsValue + physicalTotal;
+  const prevNetWorth    = netWorth - totalDayChange;
+  const dayChangePct    = prevNetWorth !== 0
+    ? (totalDayChange / Math.abs(prevNetWorth)) * 100
+    : 0;
+
+  // ── Projections (physical assets held at current value — no CAGR yet) ──
+  const proj1y = parseFloat(stocksStats.rows[0].proj_1y) +
+                 parseFloat(metalsStats.rows[0].proj_1y) +
+                 parseFloat(mfStats.rows[0].proj_1y) +
+                 physicalTotal;
+  const proj3y = parseFloat(stocksStats.rows[0].proj_3y) +
+                 parseFloat(metalsStats.rows[0].proj_3y) +
+                 parseFloat(mfStats.rows[0].proj_3y) +
+                 physicalTotal;
+  const proj5y = parseFloat(stocksStats.rows[0].proj_5y) +
+                 parseFloat(metalsStats.rows[0].proj_5y) +
+                 parseFloat(mfStats.rows[0].proj_5y) +
+                 physicalTotal;
+
+  // ── Overall 1-year CAGR derived from projection ──────────────────────────
+  const totalAssets = stocksValue + mfValue + metalsValue + physicalTotal;
+  const totalLiabilities = totalAssets - netWorth;
+  const cagr1y = netWorth > 0 ? ((proj1y - netWorth) / netWorth) * 100 : 0;
+
+  return {
+    day_change:         parseFloat(totalDayChange.toFixed(2)),
+    day_change_pct:     parseFloat(dayChangePct.toFixed(2)),
+    projected_1y:       parseFloat(proj1y.toFixed(2)),
+    projected_3y:       parseFloat(proj3y.toFixed(2)),
+    projected_5y:       parseFloat(proj5y.toFixed(2)),
+    cagr_1y:            parseFloat(cagr1y.toFixed(2)),
+    stocks_count:       stocksStats.rows[0].stocks_count,
+    stocks_proj_1y:     parseFloat(stocksStats.rows[0].proj_1y.toFixed(2)),
+    stocks_proj_3y:     parseFloat(stocksStats.rows[0].proj_3y.toFixed(2)),
+    stocks_proj_5y:     parseFloat(stocksStats.rows[0].proj_5y.toFixed(2)),
+    mf_count:           mfStats.rows[0].mf_count,
+    other_assets_count: otherCount.rows[0].other_count,
+  };
+}
+
 // ─── GET /api/net-worth/current ────────────────────────────────────────────
 // Returns enriched payload: totals + day change + projections + counts.
 // calculateCurrentNetWorth() is kept separate for the cron job.
@@ -83,19 +211,14 @@ const getCurrent = async (req, res) => {
   try {
     const userId = req.user_id;
 
+    // ── Step 1: base totals (proven stable, same as cron) ──────────────────
     const [
       stocksBasic,
       mfBasic,
       metalsBasic,
       physicalRaw,
       liabilitiesRes,
-      stocksStats,
-      mfStats,
-      metalsStats,
-      otherCount,
-      goldDayPct,
     ] = await Promise.all([
-      // ── Basic totals ──────────────────────────────────────────────────────
       pool.query(
         `SELECT COALESCE(SUM(current_value), 0)::float8 AS val
          FROM stock_holdings WHERE user_id = $1`,
@@ -129,75 +252,6 @@ const getCurrent = async (req, res) => {
          FROM liabilities WHERE user_id = $1 AND status = 'active' AND is_deleted = false`,
         [userId]
       ),
-
-      // ── Stocks: day change + projections + count ──────────────────────────
-      pool.query(
-        `SELECT
-           COALESCE(SUM(sh.day_change * sh.quantity), 0)::float8              AS day_change,
-           COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_1y, 1.0)), 0)::float8 AS proj_1y,
-           COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_3y, 1.0)), 0)::float8 AS proj_3y,
-           COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_5y, 1.0)), 0)::float8 AS proj_5y,
-           COUNT(DISTINCT sh.tradingsymbol)::int                              AS stocks_count
-         FROM stock_holdings sh
-         LEFT JOIN asset_cagr ac ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
-         WHERE sh.user_id = $1`,
-        [userId]
-      ),
-
-      // ── MF: day change + projections + count ──────────────────────────────
-      pool.query(
-        `SELECT
-           COALESCE(SUM(COALESCE(mfh.day_pnl, 0)), 0)::float8                           AS day_change,
-           COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_1y, 1.0)), 0)::float8 AS proj_1y,
-           COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_3y, 1.0)), 0)::float8 AS proj_3y,
-           COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_5y, 1.0)), 0)::float8 AS proj_5y,
-           COUNT(DISTINCT mfh.isin)::int                                                 AS mf_count
-         FROM mutual_fund_holdings mfh
-         LEFT JOIN asset_cagr ac ON ac.symbol = mfh.isin AND ac.asset_type = 'mf'
-         WHERE mfh.user_id = $1`,
-        [userId]
-      ),
-
-      // ── Metals: projections (day change derived from live rate %) ─────────
-      pool.query(
-        `SELECT
-           COALESCE(SUM(
-             mh.quantity_grams * CASE mh.purity
-               WHEN '24k' THEN mr.gold_24k_per_gram
-               WHEN '22k' THEN mr.gold_22k_per_gram
-               ELSE mr.silver_per_gram
-             END * COALESCE(ac.multiplier_1y, 1.0)
-           ), 0)::float8 AS proj_1y,
-           COALESCE(SUM(
-             mh.quantity_grams * CASE mh.purity
-               WHEN '24k' THEN mr.gold_24k_per_gram
-               WHEN '22k' THEN mr.gold_22k_per_gram
-               ELSE mr.silver_per_gram
-             END * COALESCE(ac.multiplier_3y, 1.0)
-           ), 0)::float8 AS proj_3y,
-           COALESCE(SUM(
-             mh.quantity_grams * CASE mh.purity
-               WHEN '24k' THEN mr.gold_24k_per_gram
-               WHEN '22k' THEN mr.gold_22k_per_gram
-               ELSE mr.silver_per_gram
-             END * COALESCE(ac.multiplier_5y, 1.0)
-           ), 0)::float8 AS proj_5y
-         FROM metal_holdings mh
-         CROSS JOIN (SELECT * FROM metal_rates_cache ORDER BY fetched_at DESC LIMIT 1) mr
-         LEFT JOIN asset_cagr ac ON ac.asset_type = 'metal' AND ac.symbol = mh.metal_type
-         WHERE mh.user_id = $1`,
-        [userId]
-      ),
-
-      // ── Other assets: count ───────────────────────────────────────────────
-      pool.query(
-        `SELECT COUNT(*)::int AS other_count
-         FROM physical_assets WHERE user_id = $1 AND is_active = true`,
-        [userId]
-      ),
-
-      // ── Gold daily change % (live scrape, graceful fallback) ──────────────
-      fetchGoldDayChangePct().catch(() => 0),
     ]);
 
     // ── Physical assets total (WDV for vehicles, market value for real estate)
@@ -213,60 +267,33 @@ const getCurrent = async (req, res) => {
       }
     }
 
-    // ── Net worth totals ──────────────────────────────────────────────────────
-    const stocksValue  = parseFloat(stocksBasic.rows[0].val);
-    const mfValue      = parseFloat(mfBasic.rows[0].val);
-    const metalsValue  = parseFloat(metalsBasic.rows[0].val);
-    const totalAssets  = stocksValue + mfValue + metalsValue + physicalTotal;
-    const totalLiabilities = parseFloat(liabilitiesRes.rows[0].val);
-    const netWorth     = totalAssets - totalLiabilities;
+    const stocksValue       = parseFloat(stocksBasic.rows[0].val);
+    const mfValue           = parseFloat(mfBasic.rows[0].val);
+    const metalsValue       = parseFloat(metalsBasic.rows[0].val);
+    const totalAssets       = stocksValue + mfValue + metalsValue + physicalTotal;
+    const totalLiabilities  = parseFloat(liabilitiesRes.rows[0].val);
+    const netWorth          = totalAssets - totalLiabilities;
 
-    // ── Day changes ───────────────────────────────────────────────────────────
-    // Metals: matches formula in metalsController (current - current/(1+pct))
-    const metalsDayChange = goldDayPct !== 0
-      ? metalsValue - metalsValue / (1 + goldDayPct)
-      : 0;
-    const stocksDayChange = parseFloat(stocksStats.rows[0].day_change);
-    const mfDayChange     = parseFloat(mfStats.rows[0].day_change);
-    const totalDayChange  = stocksDayChange + metalsDayChange + mfDayChange;
-    const prevNetWorth    = netWorth - totalDayChange;
-    const dayChangePct    = prevNetWorth !== 0
-      ? (totalDayChange / Math.abs(prevNetWorth)) * 100
-      : 0;
-
-    // ── Projections (physical assets held at current value — no CAGR yet) ────
-    const proj1y = parseFloat(stocksStats.rows[0].proj_1y) +
-                   parseFloat(metalsStats.rows[0].proj_1y) +
-                   parseFloat(mfStats.rows[0].proj_1y) +
-                   physicalTotal;
-    const proj3y = parseFloat(stocksStats.rows[0].proj_3y) +
-                   parseFloat(metalsStats.rows[0].proj_3y) +
-                   parseFloat(mfStats.rows[0].proj_3y) +
-                   physicalTotal;
-    const proj5y = parseFloat(stocksStats.rows[0].proj_5y) +
-                   parseFloat(metalsStats.rows[0].proj_5y) +
-                   parseFloat(mfStats.rows[0].proj_5y) +
-                   physicalTotal;
-
-    // ── Overall 1-year CAGR derived from projection ───────────────────────────
-    const cagr1y = netWorth > 0 ? ((proj1y - netWorth) / netWorth) * 100 : 0;
+    // ── Step 2: enrichment (day change + projections + counts) ─────────────
+    // Non-fatal: if any enrichment query fails, base net worth is still returned.
+    let enrichment = {
+      day_change: 0, day_change_pct: 0,
+      projected_1y: 0, projected_3y: 0, projected_5y: 0,
+      cagr_1y: 0,
+      stocks_count: 0, stocks_proj_1y: 0, stocks_proj_3y: 0, stocks_proj_5y: 0,
+      mf_count: 0, other_assets_count: 0,
+    };
+    try {
+      enrichment = await computeEnrichment(userId, stocksValue, mfValue, metalsValue, physicalTotal);
+    } catch (enrichErr) {
+      console.error("[net-worth/current] Enrichment failed (non-fatal):", enrichErr.message);
+    }
 
     return success(res, {
-      total_assets:        parseFloat(totalAssets.toFixed(2)),
-      total_liabilities:   parseFloat(totalLiabilities.toFixed(2)),
-      net_worth:           parseFloat(netWorth.toFixed(2)),
-      day_change:          parseFloat(totalDayChange.toFixed(2)),
-      day_change_pct:      parseFloat(dayChangePct.toFixed(2)),
-      projected_1y:        parseFloat(proj1y.toFixed(2)),
-      projected_3y:        parseFloat(proj3y.toFixed(2)),
-      projected_5y:        parseFloat(proj5y.toFixed(2)),
-      cagr_1y:             parseFloat(cagr1y.toFixed(2)),
-      stocks_count:        stocksStats.rows[0].stocks_count,
-      stocks_proj_1y:      parseFloat(stocksStats.rows[0].proj_1y.toFixed(2)),
-      stocks_proj_3y:      parseFloat(stocksStats.rows[0].proj_3y.toFixed(2)),
-      stocks_proj_5y:      parseFloat(stocksStats.rows[0].proj_5y.toFixed(2)),
-      mf_count:            mfStats.rows[0].mf_count,
-      other_assets_count:  otherCount.rows[0].other_count,
+      total_assets:      parseFloat(totalAssets.toFixed(2)),
+      total_liabilities: parseFloat(totalLiabilities.toFixed(2)),
+      net_worth:         parseFloat(netWorth.toFixed(2)),
+      ...enrichment,
     });
   } catch (err) {
     console.error("[net-worth/current GET] Error:", err.message);
