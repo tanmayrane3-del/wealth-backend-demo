@@ -126,7 +126,10 @@ const syncHoldings = async (req, res) => {
     // Cast cagr_1y to float8: pg returns NUMERIC columns as strings, which
     // Gson on Android silently drops when deserializing into Double?.
     const dbResult = await pool.query(
-      `SELECT sh.*, ac.cagr_1y::float8 AS cagr_1y
+      `SELECT sh.*,
+              ac.cagr_1y::float8 AS cagr_1y,
+              ac.cagr_3y::float8 AS cagr_3y,
+              ac.cagr_5y::float8 AS cagr_5y
        FROM stock_holdings sh
        LEFT JOIN asset_cagr ac
          ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
@@ -157,7 +160,10 @@ const getHoldings = async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT sh.*, ac.cagr_1y::float8 AS cagr_1y
+      `SELECT sh.*,
+              ac.cagr_1y::float8 AS cagr_1y,
+              ac.cagr_3y::float8 AS cagr_3y,
+              ac.cagr_5y::float8 AS cagr_5y
        FROM stock_holdings sh
        LEFT JOIN asset_cagr ac
          ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
