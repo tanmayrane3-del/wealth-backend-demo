@@ -72,6 +72,7 @@ const getCurrent = async (req, res) => {
       metalsBasic,
       physicalRaw,
       liabilitiesRes,
+      liabProjectionRows,
       stocksStats,
       mfStats,
       metalsStats,
@@ -113,16 +114,20 @@ const getCurrent = async (req, res) => {
         [userId]
       ),
 
-      // ── Stocks: day change + per-card projections + weighted CAGR numerators + count ──
+      // ── Per-loan rows for projection (principal reduces to 0 at end of tenure) ──
+      pool.query(
+        `SELECT outstanding_principal::float8, tenure_months::int, start_date
+         FROM liabilities WHERE user_id = $1 AND status = 'active' AND is_deleted = false`,
+        [userId]
+      ),
+
+      // ── Stocks: day change + per-card projections + count ─────────────────
       pool.query(
         `SELECT
            COALESCE(SUM(sh.day_change * sh.quantity), 0)::float8              AS day_change,
            COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_1y, 1.0)), 0)::float8 AS proj_1y,
            COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_3y, 1.0)), 0)::float8 AS proj_3y,
            COALESCE(SUM(sh.current_value * COALESCE(ac.multiplier_5y, 1.0)), 0)::float8 AS proj_5y,
-           COALESCE(SUM(sh.current_value * COALESCE(ac.cagr_1y, 0)), 0)::float8         AS cagr1y_wt,
-           COALESCE(SUM(sh.current_value * COALESCE(ac.cagr_3y, 0)), 0)::float8         AS cagr3y_wt,
-           COALESCE(SUM(sh.current_value * COALESCE(ac.cagr_5y, 0)), 0)::float8         AS cagr5y_wt,
            COUNT(DISTINCT sh.tradingsymbol)::int                              AS stocks_count
          FROM stock_holdings sh
          LEFT JOIN asset_cagr ac ON ac.symbol = sh.tradingsymbol AND ac.asset_type = 'stock'
@@ -130,16 +135,13 @@ const getCurrent = async (req, res) => {
         [userId]
       ),
 
-      // ── MF: day change + per-card projections + weighted CAGR numerators + count ──
+      // ── MF: day change + per-card projections + count ─────────────────────
       pool.query(
         `SELECT
            COALESCE(SUM(COALESCE(mfh.day_pnl, 0)), 0)::float8                                    AS day_change,
            COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_1y, 1.0)), 0)::float8 AS proj_1y,
            COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_3y, 1.0)), 0)::float8 AS proj_3y,
            COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.multiplier_5y, 1.0)), 0)::float8 AS proj_5y,
-           COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.cagr_1y, 0)), 0)::float8        AS cagr1y_wt,
-           COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.cagr_3y, 0)), 0)::float8        AS cagr3y_wt,
-           COALESCE(SUM(COALESCE(mfh.current_value, mfh.amount_invested) * COALESCE(ac.cagr_5y, 0)), 0)::float8        AS cagr5y_wt,
            COUNT(DISTINCT mfh.isin)::int                                                          AS mf_count
          FROM mutual_fund_holdings mfh
          LEFT JOIN asset_cagr ac ON ac.symbol = mfh.isin AND ac.asset_type = 'mf'
@@ -147,7 +149,7 @@ const getCurrent = async (req, res) => {
         [userId]
       ),
 
-      // ── Metals: per-card projections + weighted CAGR numerators ──────────
+      // ── Metals: per-card projections ──────────────────────────────────────
       pool.query(
         `SELECT
            COALESCE(SUM(
@@ -170,28 +172,7 @@ const getCurrent = async (req, res) => {
                WHEN '22k' THEN mr.gold_22k_per_gram
                ELSE mr.silver_per_gram
              END * COALESCE(ac.multiplier_5y, 1.0)
-           ), 0)::float8 AS proj_5y,
-           COALESCE(SUM(
-             mh.quantity_grams * CASE mh.purity
-               WHEN '24k' THEN mr.gold_24k_per_gram
-               WHEN '22k' THEN mr.gold_22k_per_gram
-               ELSE mr.silver_per_gram
-             END * COALESCE(ac.cagr_1y, 0)
-           ), 0)::float8 AS cagr1y_wt,
-           COALESCE(SUM(
-             mh.quantity_grams * CASE mh.purity
-               WHEN '24k' THEN mr.gold_24k_per_gram
-               WHEN '22k' THEN mr.gold_22k_per_gram
-               ELSE mr.silver_per_gram
-             END * COALESCE(ac.cagr_3y, 0)
-           ), 0)::float8 AS cagr3y_wt,
-           COALESCE(SUM(
-             mh.quantity_grams * CASE mh.purity
-               WHEN '24k' THEN mr.gold_24k_per_gram
-               WHEN '22k' THEN mr.gold_22k_per_gram
-               ELSE mr.silver_per_gram
-             END * COALESCE(ac.cagr_5y, 0)
-           ), 0)::float8 AS cagr5y_wt
+           ), 0)::float8 AS proj_5y
          FROM metal_holdings mh
          CROSS JOIN (SELECT * FROM metal_rates_cache ORDER BY fetched_at DESC LIMIT 1) mr
          LEFT JOIN asset_cagr ac ON ac.asset_type = 'metal' AND ac.symbol = mh.metal_type::text
@@ -210,7 +191,7 @@ const getCurrent = async (req, res) => {
       fetchGoldDayChangePct().catch(() => 0),
     ]);
 
-    // ── Physical assets total (WDV / market value) ────────────────────────
+    // ── Physical assets: current total (WDV / market value) ──────────────
     let physicalTotal = 0;
     const today = new Date();
     for (const asset of physicalRaw.rows) {
@@ -223,49 +204,67 @@ const getCurrent = async (req, res) => {
       }
     }
 
+    // ── Physical projections: -15% WDV per year (compound) ───────────────
+    const physProj1y = physicalTotal * Math.pow(0.85, 1);
+    const physProj3y = physicalTotal * Math.pow(0.85, 3);
+    const physProj5y = physicalTotal * Math.pow(0.85, 5);
+
+    // ── Loan projections: linear principal reduction to 0 at tenure end ──
+    // For each active loan: months_remaining = end_date - today
+    // principal_per_month = outstanding / months_remaining
+    // liab after n months = max(0, outstanding - n * principal_per_month)
+    let liabProj1y = 0, liabProj3y = 0, liabProj5y = 0;
+    for (const loan of liabProjectionRows.rows) {
+      const outstanding = parseFloat(loan.outstanding_principal);
+      const endDate = new Date(loan.start_date);
+      endDate.setMonth(endDate.getMonth() + loan.tenure_months);
+      const monthsRem = Math.max(0, Math.round((endDate - today) / (1000 * 60 * 60 * 24 * 30.44)));
+      const ppm = monthsRem > 0 ? outstanding / monthsRem : outstanding;
+      liabProj1y += Math.max(0, outstanding - 12 * ppm);
+      liabProj3y += Math.max(0, outstanding - 36 * ppm);
+      liabProj5y += Math.max(0, outstanding - 60 * ppm);
+    }
+
     // ── Net worth totals ──────────────────────────────────────────────────
-    const stocksValue       = parseFloat(stocksBasic.rows[0].val);
-    const mfValue           = parseFloat(mfBasic.rows[0].val);
-    const metalsValue       = parseFloat(metalsBasic.rows[0].val);
-    const totalAssets       = stocksValue + mfValue + metalsValue + physicalTotal;
-    const totalLiabilities  = parseFloat(liabilitiesRes.rows[0].val);
-    const netWorth          = totalAssets - totalLiabilities;
+    const stocksValue      = parseFloat(stocksBasic.rows[0].val);
+    const mfValue          = parseFloat(mfBasic.rows[0].val);
+    const metalsValue      = parseFloat(metalsBasic.rows[0].val);
+    const totalAssets      = stocksValue + mfValue + metalsValue + physicalTotal;
+    const totalLiabilities = parseFloat(liabilitiesRes.rows[0].val);
+    const netWorth         = totalAssets - totalLiabilities;
 
     // ── Day changes ───────────────────────────────────────────────────────
-    const metalsDayChange  = goldDayPct !== 0
+    const metalsDayChange = goldDayPct !== 0
       ? metalsValue - metalsValue / (1 + goldDayPct)
       : 0;
-    const totalDayChange   = parseFloat(stocksStats.rows[0].day_change)
-                           + parseFloat(mfStats.rows[0].day_change)
-                           + metalsDayChange;
-    const prevNetWorth     = netWorth - totalDayChange;
-    const dayChangePct     = prevNetWorth !== 0
+    const totalDayChange  = parseFloat(stocksStats.rows[0].day_change)
+                          + parseFloat(mfStats.rows[0].day_change)
+                          + metalsDayChange;
+    const prevNetWorth    = netWorth - totalDayChange;
+    const dayChangePct    = prevNetWorth !== 0
       ? (totalDayChange / Math.abs(prevNetWorth)) * 100
       : 0;
 
-    // ── Weighted average portfolio CAGR ───────────────────────────────────
-    // Weights = current investment value; physical assets contribute 0 to
-    // the numerator (no CAGR data) but are included in the denominator.
-    const totalInvValue = totalAssets; // physical is part of denominator
-    const cagr1yNumerator = parseFloat(stocksStats.rows[0].cagr1y_wt)
-                          + parseFloat(mfStats.rows[0].cagr1y_wt)
-                          + parseFloat(metalsStats.rows[0].cagr1y_wt);
-    const cagr3yNumerator = parseFloat(stocksStats.rows[0].cagr3y_wt)
-                          + parseFloat(mfStats.rows[0].cagr3y_wt)
-                          + parseFloat(metalsStats.rows[0].cagr3y_wt);
-    const cagr5yNumerator = parseFloat(stocksStats.rows[0].cagr5y_wt)
-                          + parseFloat(mfStats.rows[0].cagr5y_wt)
-                          + parseFloat(metalsStats.rows[0].cagr5y_wt);
+    // ── Net worth projections: each asset projected individually ──────────
+    // proj_nY = stocks_proj + mf_proj + metals_proj + physical_proj - liab_proj
+    const stocksProj1y  = parseFloat(stocksStats.rows[0].proj_1y);
+    const stocksProj3y  = parseFloat(stocksStats.rows[0].proj_3y);
+    const stocksProj5y  = parseFloat(stocksStats.rows[0].proj_5y);
+    const mfProj1y      = parseFloat(mfStats.rows[0].proj_1y);
+    const mfProj3y      = parseFloat(mfStats.rows[0].proj_3y);
+    const mfProj5y      = parseFloat(mfStats.rows[0].proj_5y);
+    const metalsProj1y  = parseFloat(metalsStats.rows[0].proj_1y);
+    const metalsProj3y  = parseFloat(metalsStats.rows[0].proj_3y);
+    const metalsProj5y  = parseFloat(metalsStats.rows[0].proj_5y);
 
-    const weightedCagr1y = totalInvValue > 0 ? cagr1yNumerator / totalInvValue : 0; // decimal e.g. 0.13
-    const weightedCagr3y = totalInvValue > 0 ? cagr3yNumerator / totalInvValue : 0;
-    const weightedCagr5y = totalInvValue > 0 ? cagr5yNumerator / totalInvValue : 0;
+    const proj1y = stocksProj1y + mfProj1y + metalsProj1y + physProj1y - liabProj1y;
+    const proj3y = stocksProj3y + mfProj3y + metalsProj3y + physProj3y - liabProj3y;
+    const proj5y = stocksProj5y + mfProj5y + metalsProj5y + physProj5y - liabProj5y;
 
-    // ── Net worth projections (weighted CAGR applied to current net worth) ─
-    // 1Y: simple growth; 3Y/5Y: compound
-    const proj1y = netWorth * (1 + weightedCagr1y);
-    const proj3y = netWorth * Math.pow(1 + weightedCagr3y, 3);
-    const proj5y = netWorth * Math.pow(1 + weightedCagr5y, 5);
+    // ── NW CAGR derived from projections: (NW_future / NW_now)^(1/n) - 1 ─
+    const cagr1y = netWorth > 0 ? ((proj1y / netWorth) - 1) * 100                     : 0;
+    const cagr3y = netWorth > 0 ? (Math.pow(proj3y / netWorth, 1 / 3) - 1) * 100      : 0;
+    const cagr5y = netWorth > 0 ? (Math.pow(proj5y / netWorth, 1 / 5) - 1) * 100      : 0;
 
     return success(res, {
       total_assets:        parseFloat(totalAssets.toFixed(2)),
@@ -276,11 +275,13 @@ const getCurrent = async (req, res) => {
       projected_1y:        parseFloat(proj1y.toFixed(2)),
       projected_3y:        parseFloat(proj3y.toFixed(2)),
       projected_5y:        parseFloat(proj5y.toFixed(2)),
-      cagr_1y:             parseFloat((weightedCagr1y * 100).toFixed(2)),
+      cagr_1y:             parseFloat(cagr1y.toFixed(2)),
+      cagr_3y:             parseFloat(cagr3y.toFixed(2)),
+      cagr_5y:             parseFloat(cagr5y.toFixed(2)),
       stocks_count:        stocksStats.rows[0].stocks_count,
-      stocks_proj_1y:      parseFloat(parseFloat(stocksStats.rows[0].proj_1y).toFixed(2)),
-      stocks_proj_3y:      parseFloat(parseFloat(stocksStats.rows[0].proj_3y).toFixed(2)),
-      stocks_proj_5y:      parseFloat(parseFloat(stocksStats.rows[0].proj_5y).toFixed(2)),
+      stocks_proj_1y:      parseFloat(stocksProj1y.toFixed(2)),
+      stocks_proj_3y:      parseFloat(stocksProj3y.toFixed(2)),
+      stocks_proj_5y:      parseFloat(stocksProj5y.toFixed(2)),
       mf_count:            mfStats.rows[0].mf_count,
       other_assets_count:  otherCount.rows[0].other_count,
     });
