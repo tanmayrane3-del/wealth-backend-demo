@@ -52,16 +52,39 @@ const getSummary = async (req, res) => {
     );
 
     const assets = result.rows;
-    const total_current_value = parseFloat(
-      assets
-        .reduce((sum, a) => {
-          const val = a.current_market_value ?? a.purchase_price;
-          return sum + parseFloat(val || 0);
-        }, 0)
-        .toFixed(2)
-    );
+    const today = new Date();
 
-    return success(res, { total_current_value, assets });
+    // Compute WDV for each asset (same formula as netWorthController)
+    let total_current_value = 0;
+    let proj_1y = 0, proj_3y = 0, proj_5y = 0;
+
+    for (const a of assets) {
+      let currentVal;
+      if (a.asset_type === "real_estate") {
+        currentVal = parseFloat(a.current_market_value || a.purchase_price);
+        // Real estate: held flat (no CAGR data yet)
+        proj_1y += currentVal;
+        proj_3y += currentVal;
+        proj_5y += currentVal;
+      } else {
+        // Vehicle: -15% WDV per year (compound)
+        const yearsHeld =
+          (today - new Date(a.purchase_date)) / (365.25 * 24 * 60 * 60 * 1000);
+        currentVal = parseFloat(a.purchase_price) * Math.pow(0.85, yearsHeld);
+        proj_1y += currentVal * Math.pow(0.85, 1);
+        proj_3y += currentVal * Math.pow(0.85, 3);
+        proj_5y += currentVal * Math.pow(0.85, 5);
+      }
+      total_current_value += currentVal;
+    }
+
+    return success(res, {
+      total_current_value: parseFloat(total_current_value.toFixed(2)),
+      proj_1y:             parseFloat(proj_1y.toFixed(2)),
+      proj_3y:             parseFloat(proj_3y.toFixed(2)),
+      proj_5y:             parseFloat(proj_5y.toFixed(2)),
+      assets,
+    });
   } catch (err) {
     console.error("[physical-assets/summary GET] Error:", err.message);
     return fail(res, err.message, 500);
