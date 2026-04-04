@@ -84,7 +84,8 @@ function getConfidence(absScore) {
 
 // ─── computePrediction ────────────────────────────────────────────────────────
 // scoreAccuracyRow: row from macro_score_accuracy, or null
-function computePrediction(totalScore, currentNifty, scoreAccuracyRow) {
+// prevNifty: previous month's final Nifty close (used as base for targets), or null
+function computePrediction(totalScore, currentNifty, scoreAccuracyRow, prevNifty) {
   const predicted_direction =
     totalScore > 0 ? "bull" : totalScore < 0 ? "bear" : "neutral";
 
@@ -100,9 +101,10 @@ function computePrediction(totalScore, currentNifty, scoreAccuracyRow) {
   }
 
   const ret = Number(predicted_return_pct);
-  const target_nifty      = Math.round(currentNifty * (1 + ret / 100));
-  const target_nifty_low  = Math.round(currentNifty * (1 + (ret - 3.5) / 100));
-  const target_nifty_high = Math.round(currentNifty * (1 + (ret + 3.5) / 100));
+  const basePrice = prevNifty ?? currentNifty;
+  const target_nifty      = Math.round(basePrice * (1 + ret / 100));
+  const target_nifty_low  = Math.round(basePrice * (1 + (ret - 3.5) / 100));
+  const target_nifty_high = Math.round(basePrice * (1 + (ret + 3.5) / 100));
 
   return {
     predicted_direction,

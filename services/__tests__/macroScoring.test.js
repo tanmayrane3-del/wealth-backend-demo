@@ -334,6 +334,7 @@ describe("getConfidence — all four tiers", () => {
 
 describe("computePrediction", () => {
   const nifty = 22000;
+  const prevNifty = 21500;
 
   test("score +2 with valid scoreAccuracyRow uses row values", () => {
     const row = { accuracy_pct: 62.5, total_months: 15, pct_positive: 60, avg_return: 2.1 };
@@ -385,5 +386,33 @@ describe("computePrediction", () => {
     const row = { accuracy_pct: 70, total_months: 20, pct_positive: 65, avg_return: 3.5 };
     const pred = computePrediction(4, nifty, row);
     assert.ok(pred.target_nifty_low < pred.target_nifty && pred.target_nifty < pred.target_nifty_high);
+  });
+
+  // ─── prevNifty parameter ─────────────────────────────────────────────────────
+
+  test("prevNifty provided → targets based on prevNifty not currentNifty", () => {
+    const pred = computePrediction(2, nifty, null, prevNifty);
+    // ret = 1.5 (default bull), basePrice = 21500
+    assert.equal(pred.target_nifty,      Math.round(prevNifty * (1 + 1.5 / 100)));
+    assert.equal(pred.target_nifty_low,  Math.round(prevNifty * (1 + (1.5 - 3.5) / 100)));
+    assert.equal(pred.target_nifty_high, Math.round(prevNifty * (1 + (1.5 + 3.5) / 100)));
+    // must differ from currentNifty-based targets
+    assert.notEqual(pred.target_nifty, Math.round(nifty * (1 + 1.5 / 100)));
+  });
+
+  test("prevNifty null → falls back to currentNifty as base", () => {
+    const pred = computePrediction(2, nifty, null, null);
+    assert.equal(pred.target_nifty, Math.round(nifty * (1 + 1.5 / 100)));
+  });
+
+  test("prevNifty undefined → falls back to currentNifty as base", () => {
+    const pred = computePrediction(2, nifty, null, undefined);
+    assert.equal(pred.target_nifty, Math.round(nifty * (1 + 1.5 / 100)));
+  });
+
+  test("prevNifty with scoreAccuracyRow → prevNifty is base, avg_return used", () => {
+    const row = { accuracy_pct: 65, total_months: 10, pct_positive: 58, avg_return: 3.0 };
+    const pred = computePrediction(3, nifty, row, prevNifty);
+    assert.equal(pred.target_nifty, Math.round(prevNifty * (1 + 3.0 / 100)));
   });
 });

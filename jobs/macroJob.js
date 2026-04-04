@@ -122,14 +122,22 @@ async function runMacroJob() {
   }
 
   // STEP L — Compute prediction
-  const prediction = computePrediction(total, current.nifty_close, scoreAccuracyRow);
+  const prediction = computePrediction(total, current.nifty_close, scoreAccuracyRow, prev?.nifty_close ?? null);
 
   // STEP M — Determine is_final
   const dayOfMonth = parseInt(today.split("-")[2]);
   const is_final = dayOfMonth >= 28;
 
   // STEP N — Upsert into macro_monthly_signal
-  // final_* columns are locked on day 28+ and never overwritten once set (COALESCE).
+  // Pre-query: check if final_score is already locked for this month
+  const existingRow = await pool.query(
+    `SELECT final_score FROM macro_monthly_signal WHERE month = $1`,
+    [monthStart]
+  );
+  const existingFinalScore = existingRow.rows[0]?.final_score ?? null;
+  const shouldLockFinal = is_final && existingFinalScore === null;
+
+  // Main upsert — never touches final_* columns (those are locked separately below)
   await pool.query(
     `INSERT INTO macro_monthly_signal (
        month, nifty_close, nasdaq_close, oil_brent, usd_inr, dxy,
@@ -142,15 +150,12 @@ async function runMacroJob() {
        predicted_direction, predicted_return_pct,
        target_nifty, target_nifty_low, target_nifty_high,
        accuracy_at_score, historical_months, pct_positive,
-       updated_at,
-       final_score, final_signal, final_direction,
-       final_target_nifty, final_return_pct, score_locked_at
+       updated_at
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
        $14,$15,$16,$17,$18,$19,$20,$21,$22,
        $23,$24,$25,$26,$27,$28,$29,
-       $30,$31,$32,$33,$34,$35,$36,$37,$38,
-       $39,$40,$41,$42,$43,$44
+       $30,$31,$32,$33,$34,$35,$36,$37,$38
      )
      ON CONFLICT (month) DO UPDATE SET
        nifty_close          = EXCLUDED.nifty_close,
@@ -189,13 +194,7 @@ async function runMacroJob() {
        accuracy_at_score    = EXCLUDED.accuracy_at_score,
        historical_months    = EXCLUDED.historical_months,
        pct_positive         = EXCLUDED.pct_positive,
-       updated_at           = EXCLUDED.updated_at,
-       final_score          = COALESCE(macro_monthly_signal.final_score,      EXCLUDED.final_score),
-       final_signal         = COALESCE(macro_monthly_signal.final_signal,     EXCLUDED.final_signal),
-       final_direction      = COALESCE(macro_monthly_signal.final_direction,  EXCLUDED.final_direction),
-       final_target_nifty   = COALESCE(macro_monthly_signal.final_target_nifty, EXCLUDED.final_target_nifty),
-       final_return_pct     = COALESCE(macro_monthly_signal.final_return_pct, EXCLUDED.final_return_pct),
-       score_locked_at      = COALESCE(macro_monthly_signal.score_locked_at,  EXCLUDED.score_locked_at)`,
+       updated_at           = EXCLUDED.updated_at`,
     [
       monthStart,                                              // $1
       current.nifty_close,                                    // $2
@@ -235,14 +234,32 @@ async function runMacroJob() {
       prediction.historical_months,                           // $36
       prediction.pct_positive,                                // $37
       new Date().toISOString(),                               // $38
-      is_final ? total : null,                                // $39 final_score
-      is_final ? signal : null,                               // $40 final_signal
-      is_final ? prediction.predicted_direction : null,       // $41 final_direction
-      is_final ? prediction.target_nifty : null,              // $42 final_target_nifty
-      is_final ? prediction.predicted_return_pct : null,      // $43 final_return_pct
-      is_final ? today : null,                                // $44 score_locked_at
     ]
   );
+
+  // Lock final_* columns once on day 28 — separate UPDATE, never overwrites
+  if (shouldLockFinal) {
+    await pool.query(
+      `UPDATE macro_monthly_signal
+       SET final_score        = $1,
+           final_signal       = $2,
+           final_direction    = $3,
+           final_target_nifty = $4,
+           final_return_pct   = $5,
+           score_locked_at    = $6
+       WHERE month = $7 AND final_score IS NULL`,
+      [
+        total,
+        signal,
+        prediction.predicted_direction,
+        prediction.target_nifty,
+        prediction.predicted_return_pct,
+        today,
+        monthStart,
+      ]
+    );
+    console.log("[MacroJob] Final score locked for", monthStart, "| score:", total, "| signal:", signal);
+  }
 
   // STEP O — Log completion
   console.log(
@@ -255,27 +272,62 @@ async function runMacroJob() {
 
   // STEP P — Auto-populate macro_backtest_results (first trading day of month only)
   if (trading_day_n === 1) {
-    updateBacktest(monthStart, current.nifty_close);
+    updateBacktest(monthStart);
   }
 }
 
 // ─── updateBacktest ───────────────────────────────────────────────────────────
 // Runs on first trading day of each month. Retries every 5 min until success.
-async function updateBacktest(monthStart, currentMonthFirstNifty) {
+async function updateBacktest(monthStart) {
   const MAX_RETRIES = 20; // ~100 minutes of retries
   let attempt = 0;
 
   while (attempt < MAX_RETRIES) {
     try {
-      // Previous month start (YYYY-MM-01)
-      const d = new Date(monthStart + "T00:00:00Z");
-      d.setUTCMonth(d.getUTCMonth() - 1);
-      const prevMonthStart = d.toISOString().slice(0, 7) + "-01";
+      // Previous month start  (e.g. monthStart='2026-05-01' → '2026-04-01')
+      const d1 = new Date(monthStart + "T00:00:00Z");
+      d1.setUTCMonth(d1.getUTCMonth() - 1);
+      const prevMonthStart = d1.toISOString().slice(0, 7) + "-01";
 
-      // Get previous month's signal row — prefer final_* (locked) over total_score
+      // Two months ago start  (e.g. '2026-03-01')
+      const d2 = new Date(monthStart + "T00:00:00Z");
+      d2.setUTCMonth(d2.getUTCMonth() - 2);
+      const prevPrevMonthStart = d2.toISOString().slice(0, 7) + "-01";
+
+      // Step 1 — Previous month's last Nifty close
+      const prevDailyResult = await pool.query(
+        `SELECT nifty_close FROM macro_factors_daily
+         WHERE date >= $1 AND date < $2
+         ORDER BY date DESC LIMIT 1`,
+        [prevMonthStart, monthStart]
+      );
+      if (prevDailyResult.rows.length === 0) {
+        console.warn("[MacroJob] Backtest: no daily rows for", prevMonthStart, "— skipping");
+        return;
+      }
+      const prevMonthFinalNifty = parseFloat(prevDailyResult.rows[0].nifty_close);
+
+      // Step 2 — Month before that's last Nifty close
+      const prevPrevDailyResult = await pool.query(
+        `SELECT nifty_close FROM macro_factors_daily
+         WHERE date >= $1 AND date < $2
+         ORDER BY date DESC LIMIT 1`,
+        [prevPrevMonthStart, prevMonthStart]
+      );
+      if (prevPrevDailyResult.rows.length === 0) {
+        console.warn("[MacroJob] Backtest: no daily rows for", prevPrevMonthStart, "— skipping");
+        return;
+      }
+      const prevPrevMonthFinalNifty = parseFloat(prevPrevDailyResult.rows[0].nifty_close);
+
+      // Step 3 — Actual return: prev month close vs prev-prev month close
+      const actual_ret_1m = parseFloat(
+        ((prevMonthFinalNifty - prevPrevMonthFinalNifty) / prevPrevMonthFinalNifty * 100).toFixed(4)
+      );
+
+      // Step 4 — Get previous month's signal — prefer final_* (locked) over total_score
       const signalResult = await pool.query(
-        `SELECT total_score, predicted_direction, nifty_close,
-                final_score, final_direction
+        `SELECT total_score, predicted_direction, final_score, final_direction
          FROM macro_monthly_signal
          WHERE month = $1`,
         [prevMonthStart]
@@ -285,34 +337,24 @@ async function updateBacktest(monthStart, currentMonthFirstNifty) {
         return;
       }
       const prevSignal = signalResult.rows[0];
-      const scoreToUse = prevSignal.final_score     ?? prevSignal.total_score;
-      const dirToUse   = prevSignal.final_direction ?? prevSignal.predicted_direction;
 
-      // Get previous month's final daily Nifty close
-      const dailyResult = await pool.query(
-        `SELECT nifty_close FROM macro_factors_daily
-         WHERE date >= $1 AND date < $2
-         ORDER BY date DESC LIMIT 1`,
-        [prevMonthStart, monthStart]
-      );
-      if (dailyResult.rows.length === 0) {
-        console.warn("[MacroJob] Backtest: no daily rows for", prevMonthStart, "— skipping");
-        return;
+      let scoreToUse, dirToUse;
+      if (prevSignal.final_score !== null) {
+        scoreToUse = prevSignal.final_score;
+        dirToUse   = prevSignal.final_direction;
+      } else {
+        console.warn("[MacroJob] Backtest: final_score not set for", prevMonthStart, "— falling back to total_score");
+        scoreToUse = prevSignal.total_score;
+        dirToUse   = prevSignal.predicted_direction;
       }
-      const prevMonthFinalNifty = parseFloat(dailyResult.rows[0].nifty_close);
 
-      // Calculate actual return
-      const actual_ret_1m = parseFloat(
-        ((currentMonthFirstNifty - prevMonthFinalNifty) / prevMonthFinalNifty * 100).toFixed(4)
-      );
-
-      // Determine if prediction was correct
+      // Step 5 — Determine if prediction was correct
       let correct = null;
-      if (dirToUse === "bull")       correct = actual_ret_1m > 0;
-      else if (dirToUse === "bear")  correct = actual_ret_1m < 0;
+      if (dirToUse === "bull")      correct = actual_ret_1m > 0;
+      else if (dirToUse === "bear") correct = actual_ret_1m < 0;
       // neutral → correct stays null
 
-      // Upsert into macro_backtest_results
+      // Step 6 — Upsert into macro_backtest_results
       await pool.query(
         `INSERT INTO macro_backtest_results
            (month, score, actual_ret_1m, predicted_direction, correct)
@@ -325,9 +367,11 @@ async function updateBacktest(monthStart, currentMonthFirstNifty) {
         [prevMonthStart, scoreToUse, actual_ret_1m, dirToUse, correct]
       );
 
+      // Step 7 — Log
       console.log(
         "[MacroJob] Backtest updated for", prevMonthStart,
         "| actual:", actual_ret_1m.toFixed(2) + "%",
+        "| score used:", scoreToUse,
         "| correct:", correct
       );
       return; // success — stop retrying
