@@ -333,7 +333,16 @@ async function updateBacktest(monthStart) {
         [prevMonthStart]
       );
       if (signalResult.rows.length === 0) {
-        console.warn("[MacroJob] Backtest: no signal row for", prevMonthStart, "— skipping");
+        const existingBacktest = await pool.query(
+          `SELECT actual_ret_1m FROM macro_backtest_results
+           WHERE month = $1 AND actual_ret_1m IS NOT NULL`,
+          [prevMonthStart]
+        );
+        if (existingBacktest.rows.length > 0) {
+          // Already seeded as historical data — nothing to do
+          return;
+        }
+        console.warn("[MacroJob] Backtest: no signal row for", prevMonthStart, "— genuine gap, skipping");
         return;
       }
       const prevSignal = signalResult.rows[0];
