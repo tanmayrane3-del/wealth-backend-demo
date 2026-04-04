@@ -129,6 +129,7 @@ async function runMacroJob() {
   const is_final = dayOfMonth >= 28;
 
   // STEP N — Upsert into macro_monthly_signal
+  // final_* columns are locked on day 28+ and never overwritten once set (COALESCE).
   await pool.query(
     `INSERT INTO macro_monthly_signal (
        month, nifty_close, nasdaq_close, oil_brent, usd_inr, dxy,
@@ -141,12 +142,15 @@ async function runMacroJob() {
        predicted_direction, predicted_return_pct,
        target_nifty, target_nifty_low, target_nifty_high,
        accuracy_at_score, historical_months, pct_positive,
-       updated_at
+       updated_at,
+       final_score, final_signal, final_direction,
+       final_target_nifty, final_return_pct, score_locked_at
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
        $14,$15,$16,$17,$18,$19,$20,$21,$22,
        $23,$24,$25,$26,$27,$28,$29,
-       $30,$31,$32,$33,$34,$35,$36,$37,$38
+       $30,$31,$32,$33,$34,$35,$36,$37,$38,
+       $39,$40,$41,$42,$43,$44
      )
      ON CONFLICT (month) DO UPDATE SET
        nifty_close          = EXCLUDED.nifty_close,
@@ -185,7 +189,13 @@ async function runMacroJob() {
        accuracy_at_score    = EXCLUDED.accuracy_at_score,
        historical_months    = EXCLUDED.historical_months,
        pct_positive         = EXCLUDED.pct_positive,
-       updated_at           = EXCLUDED.updated_at`,
+       updated_at           = EXCLUDED.updated_at,
+       final_score          = COALESCE(macro_monthly_signal.final_score,      EXCLUDED.final_score),
+       final_signal         = COALESCE(macro_monthly_signal.final_signal,     EXCLUDED.final_signal),
+       final_direction      = COALESCE(macro_monthly_signal.final_direction,  EXCLUDED.final_direction),
+       final_target_nifty   = COALESCE(macro_monthly_signal.final_target_nifty, EXCLUDED.final_target_nifty),
+       final_return_pct     = COALESCE(macro_monthly_signal.final_return_pct, EXCLUDED.final_return_pct),
+       score_locked_at      = COALESCE(macro_monthly_signal.score_locked_at,  EXCLUDED.score_locked_at)`,
     [
       monthStart,                                              // $1
       current.nifty_close,                                    // $2
@@ -218,13 +228,19 @@ async function runMacroJob() {
       is_final,                                               // $29
       prediction.predicted_direction,                         // $30
       prediction.predicted_return_pct,                        // $31
-      prediction.target_nifty,                               // $32
-      prediction.target_nifty_low,                           // $33
-      prediction.target_nifty_high,                          // $34
-      prediction.accuracy_pct,                               // $35
-      prediction.historical_months,                          // $36
-      prediction.pct_positive,                               // $37
-      new Date().toISOString(),                              // $38
+      prediction.target_nifty,                                // $32
+      prediction.target_nifty_low,                            // $33
+      prediction.target_nifty_high,                           // $34
+      prediction.accuracy_pct,                                // $35
+      prediction.historical_months,                           // $36
+      prediction.pct_positive,                                // $37
+      new Date().toISOString(),                               // $38
+      is_final ? total : null,                                // $39 final_score
+      is_final ? signal : null,                               // $40 final_signal
+      is_final ? prediction.predicted_direction : null,       // $41 final_direction
+      is_final ? prediction.target_nifty : null,              // $42 final_target_nifty
+      is_final ? prediction.predicted_return_pct : null,      // $43 final_return_pct
+      is_final ? today : null,                                // $44 score_locked_at
     ]
   );
 
@@ -256,9 +272,10 @@ async function updateBacktest(monthStart, currentMonthFirstNifty) {
       d.setUTCMonth(d.getUTCMonth() - 1);
       const prevMonthStart = d.toISOString().slice(0, 7) + "-01";
 
-      // Get previous month's signal row
+      // Get previous month's signal row — prefer final_* (locked) over total_score
       const signalResult = await pool.query(
-        `SELECT total_score, predicted_direction, nifty_close
+        `SELECT total_score, predicted_direction, nifty_close,
+                final_score, final_direction
          FROM macro_monthly_signal
          WHERE month = $1`,
         [prevMonthStart]
@@ -268,6 +285,8 @@ async function updateBacktest(monthStart, currentMonthFirstNifty) {
         return;
       }
       const prevSignal = signalResult.rows[0];
+      const scoreToUse = prevSignal.final_score     ?? prevSignal.total_score;
+      const dirToUse   = prevSignal.final_direction ?? prevSignal.predicted_direction;
 
       // Get previous month's final daily Nifty close
       const dailyResult = await pool.query(
@@ -288,10 +307,9 @@ async function updateBacktest(monthStart, currentMonthFirstNifty) {
       );
 
       // Determine if prediction was correct
-      const dir = prevSignal.predicted_direction;
       let correct = null;
-      if (dir === "bull")   correct = actual_ret_1m > 0;
-      else if (dir === "bear") correct = actual_ret_1m < 0;
+      if (dirToUse === "bull")       correct = actual_ret_1m > 0;
+      else if (dirToUse === "bear")  correct = actual_ret_1m < 0;
       // neutral → correct stays null
 
       // Upsert into macro_backtest_results
@@ -304,7 +322,7 @@ async function updateBacktest(monthStart, currentMonthFirstNifty) {
            actual_ret_1m       = EXCLUDED.actual_ret_1m,
            predicted_direction = EXCLUDED.predicted_direction,
            correct             = EXCLUDED.correct`,
-        [prevMonthStart, prevSignal.total_score, actual_ret_1m, dir, correct]
+        [prevMonthStart, scoreToUse, actual_ret_1m, dirToUse, correct]
       );
 
       console.log(
