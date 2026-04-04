@@ -29,7 +29,7 @@ const MACRO_RANGE = "MacroFactors!B2:B12";
 async function fetchMacroFactorsFromSheet() {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: process.env.MACRO_SHEET_ID,
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: MACRO_RANGE,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
