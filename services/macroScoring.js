@@ -99,9 +99,10 @@ function computePrediction(totalScore, currentNifty, scoreAccuracyRow) {
     predicted_return_pct = 0;
   }
 
-  const target_nifty      = Math.round(currentNifty * (1 + predicted_return_pct / 100));
-  const target_nifty_low  = Math.round(currentNifty * (1 + (predicted_return_pct - 3.5) / 100));
-  const target_nifty_high = Math.round(currentNifty * (1 + (predicted_return_pct + 3.5) / 100));
+  const ret = Number(predicted_return_pct);
+  const target_nifty      = Math.round(currentNifty * (1 + ret / 100));
+  const target_nifty_low  = Math.round(currentNifty * (1 + (ret - 3.5) / 100));
+  const target_nifty_high = Math.round(currentNifty * (1 + (ret + 3.5) / 100));
 
   return {
     predicted_direction,
