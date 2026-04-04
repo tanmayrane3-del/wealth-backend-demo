@@ -236,6 +236,95 @@ async function runMacroJob() {
     "| target: ₹", prediction.target_nifty,
     "| day", trading_day_n, "of month"
   );
+
+  // STEP P — Auto-populate macro_backtest_results (first trading day of month only)
+  if (trading_day_n === 1) {
+    updateBacktest(monthStart, current.nifty_close);
+  }
+}
+
+// ─── updateBacktest ───────────────────────────────────────────────────────────
+// Runs on first trading day of each month. Retries every 5 min until success.
+async function updateBacktest(monthStart, currentMonthFirstNifty) {
+  const MAX_RETRIES = 20; // ~100 minutes of retries
+  let attempt = 0;
+
+  while (attempt < MAX_RETRIES) {
+    try {
+      // Previous month start (YYYY-MM-01)
+      const d = new Date(monthStart + "T00:00:00Z");
+      d.setUTCMonth(d.getUTCMonth() - 1);
+      const prevMonthStart = d.toISOString().slice(0, 7) + "-01";
+
+      // Get previous month's signal row
+      const signalResult = await pool.query(
+        `SELECT total_score, predicted_direction, nifty_close
+         FROM macro_monthly_signal
+         WHERE month = $1`,
+        [prevMonthStart]
+      );
+      if (signalResult.rows.length === 0) {
+        console.warn("[MacroJob] Backtest: no signal row for", prevMonthStart, "— skipping");
+        return;
+      }
+      const prevSignal = signalResult.rows[0];
+
+      // Get previous month's final daily Nifty close
+      const dailyResult = await pool.query(
+        `SELECT nifty_close FROM macro_factors_daily
+         WHERE date >= $1 AND date < $2
+         ORDER BY date DESC LIMIT 1`,
+        [prevMonthStart, monthStart]
+      );
+      if (dailyResult.rows.length === 0) {
+        console.warn("[MacroJob] Backtest: no daily rows for", prevMonthStart, "— skipping");
+        return;
+      }
+      const prevMonthFinalNifty = parseFloat(dailyResult.rows[0].nifty_close);
+
+      // Calculate actual return
+      const actual_ret_1m = parseFloat(
+        ((currentMonthFirstNifty - prevMonthFinalNifty) / prevMonthFinalNifty * 100).toFixed(4)
+      );
+
+      // Determine if prediction was correct
+      const dir = prevSignal.predicted_direction;
+      let correct = null;
+      if (dir === "bull")   correct = actual_ret_1m > 0;
+      else if (dir === "bear") correct = actual_ret_1m < 0;
+      // neutral → correct stays null
+
+      // Upsert into macro_backtest_results
+      await pool.query(
+        `INSERT INTO macro_backtest_results
+           (month, score, actual_ret_1m, predicted_direction, correct)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (month) DO UPDATE SET
+           score               = EXCLUDED.score,
+           actual_ret_1m       = EXCLUDED.actual_ret_1m,
+           predicted_direction = EXCLUDED.predicted_direction,
+           correct             = EXCLUDED.correct`,
+        [prevMonthStart, prevSignal.total_score, actual_ret_1m, dir, correct]
+      );
+
+      console.log(
+        "[MacroJob] Backtest updated for", prevMonthStart,
+        "| actual:", actual_ret_1m.toFixed(2) + "%",
+        "| correct:", correct
+      );
+      return; // success — stop retrying
+
+    } catch (err) {
+      attempt++;
+      console.error(
+        `[MacroJob] Backtest attempt ${attempt} failed:`, err.message,
+        attempt < MAX_RETRIES ? "— retrying in 5 min" : "— giving up"
+      );
+      if (attempt < MAX_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, 5 * 60 * 1000));
+      }
+    }
+  }
 }
 
 // ─── startMacroCron ──────────────────────────────────────────────────────────
