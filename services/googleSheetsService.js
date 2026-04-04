@@ -38,7 +38,7 @@ async function fetchMacroFactorsFromSheet() {
 
   const parseCell = (row) => {
     if (!row || row.length === 0) return null;
-    const v = parseFloat(row[0]);
+    const v = parseFloat(String(row[0]).replace(/,/g, ''));
     return isNaN(v) ? null : v;
   };
 
