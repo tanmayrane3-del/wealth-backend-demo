@@ -58,6 +58,7 @@ app.use("/api/mutual-funds",    mutualFundsRoutes);
 app.use("/api/physical-assets", physicalAssetsRoutes);
 app.use("/api/liabilities",     liabilitiesRoutes);
 app.use("/api/net-worth",       netWorthRoutes);
+app.use("/api/macro",          require("./routes/macro"));
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -74,6 +75,55 @@ app.listen(PORT, () => {
   // Weekly CAGR calculation job (every Sunday 23:00 IST)
   const { initCagrScheduler } = require("./services/cagrCalculator");
   initCagrScheduler();
+
+  // Daily macro factors job (weekdays 7:30pm IST)
+  const { startMacroCron, runMacroJob } = require("./jobs/macroJob");
+  startMacroCron();
+
+  // Auto-run if server restarted after the cron window was missed
+  ;(async () => {
+    try {
+      const nowIST = new Date().toLocaleString("en-US", {
+        timeZone: "Asia/Kolkata",
+        hour: "numeric",
+        hour12: false,
+        weekday: "short",
+      });
+
+      const istDate = new Date(
+        new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
+      );
+      const dayOfWeek = istDate.getDay();   // 0=Sun, 6=Sat
+      const hourIST   = istDate.getHours();
+
+      const isWeekday     = dayOfWeek >= 1 && dayOfWeek <= 5;
+      const isAfterMarket = hourIST >= 16;  // after 4pm IST (market closed)
+
+      if (isWeekday && isAfterMarket) {
+        const today = new Date().toLocaleDateString("en-CA", {
+          timeZone: "Asia/Kolkata",
+        });
+
+        const pool = require("./db");
+        const result = await pool.query(
+          `SELECT date FROM macro_factors_daily WHERE date = $1 LIMIT 1`,
+          [today]
+        );
+
+        if (!result.rows || result.rows.length === 0) {
+          console.log(
+            "[MacroJob] Server restarted after market close —",
+            "no data for today yet, triggering catch-up run"
+          );
+          runMacroJob().catch((err) =>
+            console.error("[MacroJob] Catch-up run error:", err.message)
+          );
+        }
+      }
+    } catch (err) {
+      console.error("[MacroJob] Startup check failed:", err.message);
+    }
+  })();
 
   // Daily net worth snapshot at 11:00 PM IST (17:30 UTC)
   cron.schedule("30 17 * * *", async () => {

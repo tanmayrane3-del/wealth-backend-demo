@@ -1,0 +1,120 @@
+const pool = require("../db");
+const { success, fail } = require("../utils/respond");
+
+// ─── GET /api/macro/signal ────────────────────────────────────────────────────
+const getSignal = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM macro_monthly_signal ORDER BY month DESC LIMIT 1`
+    );
+    return success(res, result.rows[0] || null);
+  } catch (err) {
+    console.error("[macro/signal] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ─── GET /api/macro/history ───────────────────────────────────────────────────
+const getHistory = async (req, res) => {
+  const months = Math.min(parseInt(req.query.months) || 12, 24);
+  try {
+    const result = await pool.query(
+      `SELECT month, total_score, signal, nifty_close,
+              fii_net_mtd, dii_net_mtd, net_flow_mtd,
+              confidence, trading_day_n, predicted_direction,
+              predicted_return_pct, target_nifty, accuracy_at_score
+       FROM macro_monthly_signal
+       ORDER BY month DESC
+       LIMIT $1`,
+      [months]
+    );
+    return success(res, result.rows);
+  } catch (err) {
+    console.error("[macro/history] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ─── GET /api/macro/accuracy ──────────────────────────────────────────────────
+const getAccuracy = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM macro_score_accuracy ORDER BY score ASC`
+    );
+    return success(res, result.rows);
+  } catch (err) {
+    console.error("[macro/accuracy] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ─── GET /api/macro/daily ─────────────────────────────────────────────────────
+const getDailyFactors = async (req, res) => {
+  const days = parseInt(req.query.days) || 30;
+  try {
+    const result = await pool.query(
+      `SELECT date, nifty_close, nasdaq_close, oil_brent,
+              usd_inr, india_vix_high, fii_net, dii_net
+       FROM macro_factors_daily
+       ORDER BY date DESC
+       LIMIT $1`,
+      [days]
+    );
+    return success(res, result.rows);
+  } catch (err) {
+    console.error("[macro/daily] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ─── GET /api/macro/health  (no auth) ────────────────────────────────────────
+const getHealth = async (req, res) => {
+  try {
+    const [dailyResult, signalResult] = await Promise.all([
+      pool.query(`SELECT MAX(date) AS last_date FROM macro_factors_daily`),
+      pool.query(
+        `SELECT total_score, signal, predicted_direction, target_nifty
+         FROM macro_monthly_signal ORDER BY month DESC LIMIT 1`
+      ),
+    ]);
+
+    const rawDate = dailyResult.rows[0]?.last_date;
+    const lastFetchDate = rawDate
+      ? new Date(rawDate).toISOString().split("T")[0]
+      : null;
+
+    const today = new Date().toLocaleDateString("en-CA", {
+      timeZone: "Asia/Kolkata",
+    });
+
+    const todayFetched = lastFetchDate === today;
+
+    const signalRow = signalResult.rows[0] || null;
+
+    return success(res, {
+      status: "ok",
+      last_fetch_date: lastFetchDate,
+      today_fetched: todayFetched,
+      current_signal: signalRow,
+    });
+  } catch (err) {
+    console.error("[macro/health] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
+// ─── POST /api/macro/trigger  (admin key auth, no validateSession) ────────────
+const triggerJob = (req, res) => {
+  if (req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
+    return fail(res, "Unauthorized", 401);
+  }
+
+  success(res, { success: true, message: "Job triggered" });
+
+  const { runMacroJob } = require("../jobs/macroJob");
+  runMacroJob().catch((err) =>
+    console.error("[macro/trigger] Job error:", err.message)
+  );
+};
+
+module.exports = { getSignal, getHistory, getAccuracy, getDailyFactors, getHealth, triggerJob };
