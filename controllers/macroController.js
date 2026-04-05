@@ -78,6 +78,37 @@ const getDailyFactors = async (req, res) => {
   }
 };
 
+// ─── GET /api/macro/backtest ──────────────────────────────────────────────────
+const getBacktest = async (req, res) => {
+  const months = Math.min(parseInt(req.query.months) || 24, 60);
+  try {
+    const [rowsResult, summaryResult] = await Promise.all([
+      pool.query(
+        `SELECT month, score, predicted_direction, actual_ret_1m, correct
+         FROM macro_backtest_results
+         ORDER BY month DESC LIMIT $1`,
+        [months]
+      ),
+      pool.query(
+        `SELECT
+           COUNT(*)                                               AS total_months,
+           COUNT(*) FILTER (WHERE actual_ret_1m IS NOT NULL)     AS with_returns,
+           COUNT(*) FILTER (WHERE correct = true)                AS correct_calls,
+           COUNT(*) FILTER (WHERE correct = false)               AS wrong_calls,
+           ROUND(
+             COUNT(*) FILTER (WHERE correct = true)::numeric /
+             NULLIF(COUNT(*) FILTER (WHERE correct IS NOT NULL), 0) * 100, 1
+           )                                                     AS accuracy_pct
+         FROM macro_backtest_results`
+      ),
+    ]);
+    return success(res, { rows: rowsResult.rows, summary: summaryResult.rows[0] });
+  } catch (err) {
+    console.error("[macro/backtest] Error:", err.message);
+    return fail(res, err.message, 500);
+  }
+};
+
 // ─── GET /api/macro/health  (no auth) ────────────────────────────────────────
 const getHealth = async (req, res) => {
   try {
@@ -128,4 +159,4 @@ const triggerJob = (req, res) => {
   );
 };
 
-module.exports = { getSignal, getHistory, getAccuracy, getDailyFactors, getHealth, triggerJob };
+module.exports = { getSignal, getHistory, getAccuracy, getDailyFactors, getBacktest, getHealth, triggerJob };
