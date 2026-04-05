@@ -19,12 +19,23 @@ const getHistory = async (req, res) => {
   const months = Math.min(parseInt(req.query.months) || 12, 24);
   try {
     const result = await pool.query(
-      `SELECT month, total_score, signal, nifty_close,
-              fii_net_mtd, dii_net_mtd, net_flow_mtd,
-              confidence, trading_day_n, predicted_direction,
-              predicted_return_pct, target_nifty, accuracy_at_score
-       FROM macro_monthly_signal
-       ORDER BY month DESC
+      `SELECT m.month, m.total_score, m.signal, m.nifty_close,
+              m.fii_net_mtd, m.dii_net_mtd, m.net_flow_mtd,
+              m.confidence, m.trading_day_n, m.predicted_direction,
+              m.predicted_return_pct, m.target_nifty, m.accuracy_at_score,
+              m.final_score, m.final_direction, m.is_final,
+              b.actual_ret_1m,
+              CASE
+                WHEN b.actual_ret_1m IS NULL THEN NULL
+                WHEN COALESCE(m.final_direction, m.predicted_direction) = 'bull'
+                     AND b.actual_ret_1m > 0 THEN true
+                WHEN COALESCE(m.final_direction, m.predicted_direction) = 'bear'
+                     AND b.actual_ret_1m < 0 THEN true
+                ELSE false
+              END AS is_correct
+       FROM macro_monthly_signal m
+       LEFT JOIN macro_backtest_results b ON b.month = m.month
+       ORDER BY m.month DESC
        LIMIT $1`,
       [months]
     );
