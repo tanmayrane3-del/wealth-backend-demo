@@ -400,12 +400,14 @@ async function updateBacktest(monthStart) {
 
 // ─── startMacroCron ──────────────────────────────────────────────────────────
 function startMacroCron() {
-  cron.schedule("0 14 * * 1-5", () => {
+  const handler = () =>
     runMacroJob().catch((err) =>
       console.error("[MacroJob] Cron run error:", err.message)
     );
-  });
-  console.log("[MacroJob] Cron registered — fires at 14:00 UTC (7:30pm IST) weekdays");
+
+  cron.schedule("30 3 * * 1-5", handler);  // 9:00 AM IST
+  cron.schedule("30 12 * * 1-5", handler); // 6:00 PM IST
+  console.log("[MacroJob] Cron registered — fires at 03:30 UTC (9:00am IST) and 12:30 UTC (6:00pm IST) weekdays");
 }
 
 module.exports = { startMacroCron, runMacroJob };
